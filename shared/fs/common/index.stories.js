@@ -66,18 +66,6 @@ export const commonProvider = {
     enableDriver: Sb.action('enableDriver'),
     openInSystemFileManager: Sb.action('openInSystemFileManager'),
   }),
-  FilenameText: (o: any) => {
-    const [fileNameWithoutExtension, fileExtension] = Constants.splitFileNameAndExtension(
-      o.path ? Types.getPathName(o.path) : o.filename || ''
-    )
-    return {
-      fileExtension,
-      fileNameWithoutExtension,
-      selectable: o.selectable,
-      style: o.style,
-      type: o.type,
-    }
-  },
   FolderViewFilter: (props: any) => ({
     onUpdate: Sb.action('onUpdate'),
     pathItem: Constants.makeFolder(),

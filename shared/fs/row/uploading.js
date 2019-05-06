@@ -5,7 +5,7 @@ import * as Constants from '../../constants/fs'
 import * as Styles from '../../styles'
 import {rowStyles} from './common'
 import * as Kb from '../../common-adapters'
-import {FilenameText, PathItemIcon} from '../common'
+import {Filename, PathItemIcon} from '../common'
 
 type UploadingProps = {
   path: Types.Path,
@@ -42,7 +42,7 @@ const Uploading = (props: UploadingProps) => (
     }
     body={
       <Kb.Box key="main" style={rowStyles.itemBox}>
-        <FilenameText
+        <Filename
           path={props.path}
           type={Constants.pathTypeToTextType(props.type)}
           style={Styles.collapseStyles([

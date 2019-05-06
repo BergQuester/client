@@ -56,18 +56,6 @@ const providers = Storybook.createPropProviderWithCommon({
     convRows: [],
     onViewAll: () => {},
   }),
-  FilenameText: (o: any) => {
-    const [fileNameWithoutExtension, fileExtension] = Constants.splitFileNameAndExtension(
-      o.path ? Types.getPathName(o.path) : o.filename || ''
-    )
-    return {
-      fileExtension,
-      fileNameWithoutExtension,
-      selectable: o.selectable,
-      style: o.style,
-      type: o.type,
-    }
-  },
   FilesPreview: () => ({
     loadTlfUpdates: () => Storybook.action('loadTlfUpdates'),
     userTlfUpdates: [],

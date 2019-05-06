@@ -3,7 +3,7 @@ import * as React from 'react'
 import * as Kb from '../common-adapters'
 import * as Styles from '../styles'
 import * as FsTypes from '../constants/types/fs'
-import {FilenameText} from '../fs/common'
+import {Filename} from '../fs/common'
 import ConnectedUsernames from '../common-adapters/usernames/remote-container'
 
 type FileUpdateProps = {|
@@ -44,7 +44,7 @@ export const FileUpdate = (props: FileUpdateProps) => (
           <Kb.Icon type="icon-addon-file-uploading" style={Kb.iconCastPlatformStyles(styles.iconBadge)} />
         </Kb.Box>
       )}
-      <FilenameText type="Body" path={props.path} />
+      <Filename type="Body" path={props.path} />
     </Kb.Box2>
   </Kb.ClickableBox>
 )
