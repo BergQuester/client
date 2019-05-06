@@ -759,6 +759,21 @@ func (fbo *folderBranchOps) clearConflictView(ctx context.Context) (
 	return fbo.cr.clearConflictRecords()
 }
 
+// forceStuckConflictForTesting forces the TLF into a stuck conflict
+// view, for testing.
+func (fbo *folderBranchOps) forceStuckConflictForTesting(
+	ctx context.Context) error {
+	// * Make a no-op revision with an empty resolutionOp. Wait for it
+	//   to flush to the server.
+	// * Disable updates.
+	// * Roll back the local view to the original revision.
+	// * Set CR to always fail.
+	// * Make fake conflicting files to trigger CR. Make one for each
+	//   attempt needed to result in stuck CR.
+	// * Once it's stuck, remove the "always-fail" mode from CR.
+	return nil
+}
+
 func (fbo *folderBranchOps) setBranchIDLocked(
 	lState *kbfssync.LockState, unmergedBID kbfsmd.BranchID) {
 	fbo.mdWriterLock.AssertLocked(lState)
