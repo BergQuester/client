@@ -6,7 +6,7 @@ import InputArea from '../input-area/container'
 import ListArea from '../list-area/container'
 import {Box, LoadingLine, Text} from '../../../common-adapters'
 import {globalStyles, globalColors, globalMargins} from '../../../styles'
-import type {Props} from './index.types'
+import {isPad} from '../../../constants/platform'
 
 const Offline = () => (
   <Box
@@ -57,9 +57,18 @@ class Conversation extends React.PureComponent<Props> {
   }
 }
 
+const tabletStyles = isPad
+  ? {
+      flex: 1,
+      borderLeftColor: 'rgba(0, 0, 0, 0.10)',
+      borderLeftWidth: 1,
+    }
+  : {}
+
 const containerStyle = {
   ...globalStyles.flexBoxColumn,
   ...globalStyles.fullHeight,
+  ...tabletStyles,
 }
 
 export default Conversation

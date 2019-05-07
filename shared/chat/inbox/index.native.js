@@ -13,7 +13,7 @@ import {debounce} from 'lodash-es'
 import UnreadShortcut from './unread-shortcut'
 import * as RowSizes from './row/sizes'
 import InboxSearch from '../inbox-search/container'
-import type {Props, RowItem, RowItemSmall} from './index.types'
+import {isPad} from '../../constants/platform'
 
 const NoChats = () => (
   <Kb.Box
@@ -260,14 +260,25 @@ class Inbox extends React.PureComponent<Props, State> {
   }
 }
 
-const styles = Styles.styleSheetCreate({
+const mobileStyles = {
   container: {
     ...Styles.globalStyles.flexBoxColumn,
     backgroundColor: Styles.globalColors.fastBlank,
     flex: 1,
     position: 'relative',
   },
-})
+}
+
+const tabletStyles = {
+  container: {
+    ...Styles.globalStyles.flexBoxColumn,
+    backgroundColor: Styles.globalColors.fastBlank,
+    width: 400,
+    position: 'relative',
+  },
+}
+
+const styles = Styles.styleSheetCreate(isPad ? tabletStyles : mobileStyles)
 
 export default Inbox
 export type {RowItem, RowItemSmall}

@@ -26,7 +26,7 @@ import * as Router2Constants from '../../constants/router2'
 import chatTeamBuildingSaga from './team-building'
 import * as TeamsConstants from '../../constants/teams'
 import logger from '../../logger'
-import {isMobile} from '../../constants/platform'
+import {isMobile, isPad} from '../../constants/platform'
 import {getPath} from '../../route-tree'
 import {NotifyPopup} from '../../native/notifications'
 import {saveAttachmentToCameraRoll, showShareActionSheetFromFile} from '../platform-specific'
@@ -2108,8 +2108,9 @@ const navigateToThreadRoute = conversationIDKey => {
     return RouteTreeGen.createNavigateTo({path: Constants.threadRoute})
   }
 
+  const selected = isPad ? 'chatRoot' : isMobile ? 'chatConversation' : 'chatRoot'
   return RouteTreeGen.createNavigateAppend({
-    path: [{props: {conversationIDKey}, selected: isMobile ? 'chatConversation' : 'chatRoot'}],
+    path: [{props: {conversationIDKey}, selected}],
   })
 }
 
@@ -2131,6 +2132,7 @@ const deselectConversation = (state, action) => {
 }
 
 const mobileNavigateOnSelect = (state, action) => {
+  console.log('SELECT', action)
   if (Constants.isValidConversationIDKey(action.payload.conversationIDKey)) {
     if (action.payload.reason === 'focused') {
       return // never nav if this is from a nav

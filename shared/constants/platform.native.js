@@ -30,6 +30,7 @@ export const mobileOsVersion = Platform.Version
 export const isAndroidNewerThanM = isAndroid && parseInt(mobileOsVersion) > 22
 export const isAndroidNewerThanN = isAndroid && parseInt(mobileOsVersion, 10) >= 26
 export const shortcutSymbol = ''
+export const isPad = isIOS ? Platform.isPad : false
 
 export const isIPhoneX = iPhoneXHelper.isIphoneX()
 

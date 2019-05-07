@@ -9,6 +9,7 @@ import SafeAreaView, {SafeAreaViewTop} from '../safe-area-view'
 import * as Styles from '../../styles'
 import type {Action, Props, LeftActionProps} from './types'
 import flags from '../../util/feature-flags'
+import {isPad} from '../../util/container'
 
 const MAX_RIGHT_ACTIONS = 3
 type State = {|
@@ -74,17 +75,19 @@ export class HeaderHocHeader extends React.Component<Props, State> {
             </Text>
           </Box>
         )}
-        <LeftAction
-          badgeNumber={this.props.badgeNumber}
-          customCancelText={this.props.customCancelText}
-          disabled={false}
-          hasTextTitle={hasTextTitle}
-          hideBackLabel={this.props.hideBackLabel}
-          leftAction={leftAction}
-          leftActionText={this.props.leftActionText}
-          onLeftAction={onLeftAction}
-          theme={this.props.theme}
-        />
+        {isPad ? null : (
+          <LeftAction
+            badgeNumber={this.props.badgeNumber}
+            customCancelText={this.props.customCancelText}
+            disabled={false}
+            hasTextTitle={hasTextTitle}
+            hideBackLabel={this.props.hideBackLabel}
+            leftAction={leftAction}
+            leftActionText={this.props.leftActionText}
+            onLeftAction={onLeftAction}
+            theme={this.props.theme}
+          />
+        )}
         {this.props.titleComponent && (
           <Box
             style={Styles.collapseStyles([

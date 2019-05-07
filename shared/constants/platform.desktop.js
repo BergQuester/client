@@ -5,6 +5,7 @@ const platform = process.platform
 export const isMobile = false
 export const isAndroid = false
 export const isIOS = false
+export const isPad = false
 export const isLargeScreen = true
 export const isIPhoneX = false
 export const isElectron = true

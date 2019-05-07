@@ -1,5 +1,5 @@
 // @flow
-import {isMobile} from '../constants/platform'
+import {isMobile, isPad} from '../constants/platform'
 
 // Arbitrarily stackable routes from the chat tab
 const routeTree = () => {
@@ -149,9 +149,16 @@ export const newRoutes = {
     upgraded: true,
   },
   chatRoot: {
-    getScreen: () =>
+    getScreen: () => {
       // TODO mark as upgraded when inbox doesn't use routeState anymore
-      isMobile ? require('./inbox/container').default : require('./inbox-and-conversation-2.desktop').default,
+      if (isPad) {
+        return require('./inbox-and-conversation.native').default
+      } else if (isMobile) {
+        return require('./inbox/container').default
+      }
+
+      return require('./inbox-and-conversation-2.desktop').default
+    },
     upgraded: true,
   },
 }

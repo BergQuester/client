@@ -38,7 +38,7 @@ export {
 } from 'recompose'
 export {default as connect, namedConnect} from './typed-connect'
 export {default as remoteConnect} from './typed-remote-connect'
-export {isMobile} from '../constants/platform'
+export {isMobile, isPad} from '../constants/platform'
 export {anyWaiting, anyErrors} from '../constants/waiting'
 export {safeSubmit, safeSubmitPerMount} from './safe-submit'
 export type {RouteProps, TypedActions, TypedState, TypedDispatch, Dispatch}
