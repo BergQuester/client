@@ -30,7 +30,8 @@ func getBuildSpecificCommands(cl *libcmdline.CommandLine, g *libkb.GlobalContext
 		newCmdTeamRotateKey(cl, g),
 		newCmdTeamDebug(cl, g),
 		newCmdScript(cl, g),
-		NewCmdContactLookup(cl, g),
+		NwCmdContacts(cl, g),
+		NewCmdPeopleSearch(cl, g),
 	}
 }
 
@@ -68,6 +69,7 @@ func getBuildSpecificLogCommands(cl *libcmdline.CommandLine, g *libkb.GlobalCont
 func getBuildSpecificFSCommands(cl *libcmdline.CommandLine, g *libkb.GlobalContext) []cli.Command {
 	return []cli.Command{
 		NewCmdSimpleFSUpgrade(cl, g),
+		NewCmdSimpleFSForceConflict(cl, g),
 	}
 }
 

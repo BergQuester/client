@@ -47,6 +47,7 @@ type Context interface {
 	GetRunMode() kbconst.RunMode
 	GetLogDir() string
 	GetDataDir() string
+	GetEnv() *libkb.Env
 	GetMountDir() (string, error)
 	ConfigureSocketInfo() (err error)
 	CheckService() error
@@ -88,10 +89,22 @@ func NewContextFromGlobalContext(g *libkb.GlobalContext) *KBFSContext {
 // main functions.
 func NewContext() *KBFSContext {
 	g := libkb.NewGlobalContextInit()
-	g.ConfigureConfig()
-	g.ConfigureLogging()
-	g.ConfigureCaches()
-	g.ConfigureMerkleClient()
+	err := g.ConfigureConfig()
+	if err != nil {
+		panic(err)
+	}
+	err = g.ConfigureLogging()
+	if err != nil {
+		panic(err)
+	}
+	err = g.ConfigureCaches()
+	if err != nil {
+		panic(err)
+	}
+	err = g.ConfigureMerkleClient()
+	if err != nil {
+		panic(err)
+	}
 	return NewContextFromGlobalContext(g)
 }
 
@@ -108,6 +121,11 @@ func (c *KBFSContext) GetDataDir() string {
 // GetMountDir returns mount dir
 func (c *KBFSContext) GetMountDir() (string, error) {
 	return c.g.Env.GetMountDir()
+}
+
+// GetEnv returns the global Env
+func (c *KBFSContext) GetEnv() *libkb.Env {
+	return c.g.Env
 }
 
 // GetRunMode returns run mode

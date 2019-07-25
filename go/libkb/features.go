@@ -15,6 +15,7 @@ type FeatureFlags []Feature
 const (
 	EnvironmentFeatureAllowHighSkips    = Feature("env_allow_high_skips")
 	EnvironmentFeatureAutoresetPipeline = Feature("env_autoreset")
+	EnvironmentFeatureMerkleCheckpoint  = Feature("merkle_checkpoint")
 )
 
 // StringToFeatureFlags returns a set of feature flags
@@ -69,11 +70,11 @@ type FeatureFlagSet struct {
 }
 
 const (
-	FeatureFTL                = Feature("ftl")
-	FeatureIMPTOFU            = Feature("imptofu")
-	FeatureBoxAuditor         = Feature("box_auditor")
-	ExperimentalGenericProofs = Feature("experimental_generic_proofs")
-	CreateBTCBech32           = Feature("create_btc_bech32")
+	FeatureFTL                        = Feature("ftl")
+	FeatureIMPTOFU                    = Feature("imptofu")
+	FeatureBoxAuditor                 = Feature("box_auditor2")
+	ExperimentalGenericProofs         = Feature("experimental_generic_proofs")
+	FeatureCheckForHiddenChainSupport = Feature("check_for_hidden_chain_support")
 )
 
 // NewFeatureFlagSet makes a new set of feature flags.

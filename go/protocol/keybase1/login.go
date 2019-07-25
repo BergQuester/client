@@ -9,14 +9,18 @@ import (
 )
 
 type ConfiguredAccount struct {
-	Username        string `codec:"username" json:"username"`
-	HasStoredSecret bool   `codec:"hasStoredSecret" json:"hasStoredSecret"`
+	Username        string   `codec:"username" json:"username"`
+	Fullname        FullName `codec:"fullname" json:"fullname"`
+	HasStoredSecret bool     `codec:"hasStoredSecret" json:"hasStoredSecret"`
+	IsCurrent       bool     `codec:"isCurrent" json:"isCurrent"`
 }
 
 func (o ConfiguredAccount) DeepCopy() ConfiguredAccount {
 	return ConfiguredAccount{
 		Username:        o.Username,
+		Fullname:        o.Fullname.DeepCopy(),
 		HasStoredSecret: o.HasStoredSecret,
+		IsCurrent:       o.IsCurrent,
 	}
 }
 
@@ -41,7 +45,8 @@ type LoginProvisionedDeviceArg struct {
 }
 
 type LoginWithPaperKeyArg struct {
-	SessionID int `codec:"sessionID" json:"sessionID"`
+	SessionID int    `codec:"sessionID" json:"sessionID"`
+	Username  string `codec:"username" json:"username"`
 }
 
 type ClearStoredSecretArg struct {
@@ -61,6 +66,11 @@ type DeprovisionArg struct {
 
 type RecoverAccountFromEmailAddressArg struct {
 	Email string `codec:"email" json:"email"`
+}
+
+type RecoverPassphraseArg struct {
+	SessionID int    `codec:"sessionID" json:"sessionID"`
+	Username  string `codec:"username" json:"username"`
 }
 
 type PaperKeyArg struct {
@@ -91,6 +101,9 @@ type LoginOneshotArg struct {
 	PaperKey  string `codec:"paperKey" json:"paperKey"`
 }
 
+type IsOnlineArg struct {
+}
+
 type LoginInterface interface {
 	// Returns an array of information about accounts configured on the local
 	// machine. Currently configured accounts are defined as those that have stored
@@ -107,13 +120,16 @@ type LoginInterface interface {
 	// Login and unlock by
 	// - trying unlocked device keys if available
 	// - prompting for a paper key and using that
-	LoginWithPaperKey(context.Context, int) error
+	LoginWithPaperKey(context.Context, LoginWithPaperKeyArg) error
 	// Removes any existing stored secret for the given username.
 	// loginWithStoredSecret(_, username) will fail after this is called.
 	ClearStoredSecret(context.Context, ClearStoredSecretArg) error
 	Logout(context.Context, int) error
 	Deprovision(context.Context, DeprovisionArg) error
 	RecoverAccountFromEmailAddress(context.Context, string) error
+	// Guide the user through possibilities of changing their passphrase.
+	// Lets them change their passphrase using a paper key or enter the reset pipeline.
+	RecoverPassphrase(context.Context, RecoverPassphraseArg) error
 	// PaperKey generates paper backup keys for restoring an account.
 	// It calls login_ui.displayPaperKeyPhrase with the phrase.
 	PaperKey(context.Context, int) error
@@ -129,6 +145,9 @@ type LoginInterface interface {
 	// provisioning a device. It bootstraps credentials with the given
 	// paperkey
 	LoginOneshot(context.Context, LoginOneshotArg) error
+	// isOnline returns whether the device is able to open a connection to keybase.io.
+	// Used for determining whether to offer proxy settings on the login screen.
+	IsOnline(context.Context) (bool, error)
 }
 
 func LoginProtocol(i LoginInterface) rpc.Protocol {
@@ -191,7 +210,7 @@ func LoginProtocol(i LoginInterface) rpc.Protocol {
 						err = rpc.NewTypeError((*[1]LoginWithPaperKeyArg)(nil), args)
 						return
 					}
-					err = i.LoginWithPaperKey(ctx, typedArgs[0].SessionID)
+					err = i.LoginWithPaperKey(ctx, typedArgs[0])
 					return
 				},
 			},
@@ -252,6 +271,21 @@ func LoginProtocol(i LoginInterface) rpc.Protocol {
 						return
 					}
 					err = i.RecoverAccountFromEmailAddress(ctx, typedArgs[0].Email)
+					return
+				},
+			},
+			"recoverPassphrase": {
+				MakeArg: func() interface{} {
+					var ret [1]RecoverPassphraseArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]RecoverPassphraseArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]RecoverPassphraseArg)(nil), args)
+						return
+					}
+					err = i.RecoverPassphrase(ctx, typedArgs[0])
 					return
 				},
 			},
@@ -345,6 +379,16 @@ func LoginProtocol(i LoginInterface) rpc.Protocol {
 					return
 				},
 			},
+			"isOnline": {
+				MakeArg: func() interface{} {
+					var ret [1]IsOnlineArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					ret, err = i.IsOnline(ctx)
+					return
+				},
+			},
 		},
 	}
 }
@@ -381,8 +425,7 @@ func (c LoginClient) LoginProvisionedDevice(ctx context.Context, __arg LoginProv
 // Login and unlock by
 // - trying unlocked device keys if available
 // - prompting for a paper key and using that
-func (c LoginClient) LoginWithPaperKey(ctx context.Context, sessionID int) (err error) {
-	__arg := LoginWithPaperKeyArg{SessionID: sessionID}
+func (c LoginClient) LoginWithPaperKey(ctx context.Context, __arg LoginWithPaperKeyArg) (err error) {
 	err = c.Cli.Call(ctx, "keybase.1.login.loginWithPaperKey", []interface{}{__arg}, nil)
 	return
 }
@@ -408,6 +451,13 @@ func (c LoginClient) Deprovision(ctx context.Context, __arg DeprovisionArg) (err
 func (c LoginClient) RecoverAccountFromEmailAddress(ctx context.Context, email string) (err error) {
 	__arg := RecoverAccountFromEmailAddressArg{Email: email}
 	err = c.Cli.Call(ctx, "keybase.1.login.recoverAccountFromEmailAddress", []interface{}{__arg}, nil)
+	return
+}
+
+// Guide the user through possibilities of changing their passphrase.
+// Lets them change their passphrase using a paper key or enter the reset pipeline.
+func (c LoginClient) RecoverPassphrase(ctx context.Context, __arg RecoverPassphraseArg) (err error) {
+	err = c.Cli.Call(ctx, "keybase.1.login.recoverPassphrase", []interface{}{__arg}, nil)
 	return
 }
 
@@ -450,5 +500,12 @@ func (c LoginClient) AccountDelete(ctx context.Context, sessionID int) (err erro
 // paperkey
 func (c LoginClient) LoginOneshot(ctx context.Context, __arg LoginOneshotArg) (err error) {
 	err = c.Cli.Call(ctx, "keybase.1.login.loginOneshot", []interface{}{__arg}, nil)
+	return
+}
+
+// isOnline returns whether the device is able to open a connection to keybase.io.
+// Used for determining whether to offer proxy settings on the login screen.
+func (c LoginClient) IsOnline(ctx context.Context) (res bool, err error) {
+	err = c.Cli.Call(ctx, "keybase.1.login.isOnline", []interface{}{IsOnlineArg{}}, &res)
 	return
 }

@@ -41,6 +41,8 @@ type KeybaseServiceMeasured struct {
 	notifyTimer                      metrics.Timer
 	notifyPathUpdatedTimer           metrics.Timer
 	putGitMetadataTimer              metrics.Timer
+	onPathChangeTimer                metrics.Timer
+	onChangeTimer                    metrics.Timer
 }
 
 var _ KeybaseService = KeybaseServiceMeasured{}
@@ -73,6 +75,10 @@ func NewKeybaseServiceMeasured(delegate KeybaseService, r metrics.Registry) Keyb
 	notifyPathUpdatedTimer := metrics.GetOrRegisterTimer("KeybaseService.NotifyPathUpdated", r)
 	putGitMetadataTimer := metrics.GetOrRegisterTimer(
 		"KeybaseService.PutGitMetadata", r)
+	onPathChangeTimer := metrics.GetOrRegisterTimer(
+		"KeybaseService.OnPathChangeTimer", r)
+	onChangeTimer := metrics.GetOrRegisterTimer(
+		"KeybaseService.OnChangeTimer", r)
 	return KeybaseServiceMeasured{
 		delegate:                         delegate,
 		resolveTimer:                     resolveTimer,
@@ -95,6 +101,8 @@ func NewKeybaseServiceMeasured(delegate KeybaseService, r metrics.Registry) Keyb
 		notifyTimer:                      notifyTimer,
 		notifyPathUpdatedTimer:           notifyPathUpdatedTimer,
 		putGitMetadataTimer:              putGitMetadataTimer,
+		onPathChangeTimer:                onPathChangeTimer,
+		onChangeTimer:                    onChangeTimer,
 	}
 }
 
@@ -234,7 +242,7 @@ func (k KeybaseServiceMeasured) CurrentSession(ctx context.Context, sessionID in
 
 // FavoriteAdd implements the KeybaseService interface for
 // KeybaseServiceMeasured.
-func (k KeybaseServiceMeasured) FavoriteAdd(ctx context.Context, folder keybase1.Folder) (err error) {
+func (k KeybaseServiceMeasured) FavoriteAdd(ctx context.Context, folder keybase1.FolderHandle) (err error) {
 	k.favoriteAddTimer.Time(func() {
 		err = k.delegate.FavoriteAdd(ctx, folder)
 	})
@@ -243,7 +251,7 @@ func (k KeybaseServiceMeasured) FavoriteAdd(ctx context.Context, folder keybase1
 
 // FavoriteDelete implements the KeybaseService interface for
 // KeybaseServiceMeasured.
-func (k KeybaseServiceMeasured) FavoriteDelete(ctx context.Context, folder keybase1.Folder) (err error) {
+func (k KeybaseServiceMeasured) FavoriteDelete(ctx context.Context, folder keybase1.FolderHandle) (err error) {
 	k.favoriteDeleteTimer.Time(func() {
 		err = k.delegate.FavoriteDelete(ctx, folder)
 	})
@@ -328,6 +336,16 @@ func (k KeybaseServiceMeasured) NotifyOverallSyncStatus(
 	return err
 }
 
+// NotifyFavoritesChanged implements the KeybaseService interface for
+// KeybaseServiceMeasured.
+func (k KeybaseServiceMeasured) NotifyFavoritesChanged(
+	ctx context.Context) (err error) {
+	k.notifyTimer.Time(func() {
+		err = k.delegate.NotifyFavoritesChanged(ctx)
+	})
+	return err
+}
+
 // FlushUserFromLocalCache implements the KeybaseService interface for
 // KeybaseServiceMeasured.
 func (k KeybaseServiceMeasured) FlushUserFromLocalCache(
@@ -349,12 +367,27 @@ func (k KeybaseServiceMeasured) EstablishMountDir(ctx context.Context) (string, 
 // PutGitMetadata implements the KeybaseDaemon interface for
 // KeybaseServiceMeasured.
 func (k KeybaseServiceMeasured) PutGitMetadata(
-	ctx context.Context, folder keybase1.Folder, repoID keybase1.RepoID,
+	ctx context.Context, folder keybase1.FolderHandle, repoID keybase1.RepoID,
 	metadata keybase1.GitLocalMetadata) (err error) {
 	k.putGitMetadataTimer.Time(func() {
 		err = k.delegate.PutGitMetadata(ctx, folder, repoID, metadata)
 	})
 	return err
+}
+
+// OnPathChange implements the SubscriptionNotifier interface.
+func (k KeybaseServiceMeasured) OnPathChange(subscriptionID SubscriptionID, path string, topic keybase1.PathSubscriptionTopic) {
+	k.onPathChangeTimer.Time(func() {
+		k.delegate.OnPathChange(subscriptionID, path, topic)
+	})
+}
+
+// OnNonPathChange implements the SubscriptionNotifier interface.
+func (k KeybaseServiceMeasured) OnNonPathChange(
+	subscriptionID SubscriptionID, topic keybase1.SubscriptionTopic) {
+	k.onChangeTimer.Time(func() {
+		k.delegate.OnNonPathChange(subscriptionID, topic)
+	})
 }
 
 // Shutdown implements the KeybaseService interface for

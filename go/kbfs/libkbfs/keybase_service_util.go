@@ -103,6 +103,7 @@ func serviceLoggedIn(ctx context.Context, config Config, session idutil.SessionI
 			wg = jManager.MakeFBOsForExistingJournals(newCtx)
 		}
 	}
+
 	err := config.MakeDiskBlockCacheIfNotExists()
 	if err != nil {
 		log.CWarningf(ctx, "serviceLoggedIn: Failed to enable disk cache: "+
@@ -123,7 +124,10 @@ func serviceLoggedIn(ctx context.Context, config Config, session idutil.SessionI
 		go bServer.RefreshAuthToken(context.Background())
 	}
 
-	config.KBFSOps().RefreshCachedFavorites(ctx)
+	if config.Mode().DoRefreshFavoritesOnInit() {
+		config.KBFSOps().RefreshCachedFavorites(
+			ctx, FavoritesRefreshModeInMainFavoritesLoop)
+	}
 	config.KBFSOps().PushStatusChange()
 	return wg
 }

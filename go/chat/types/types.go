@@ -1,6 +1,7 @@
 package types
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
@@ -34,6 +35,8 @@ const (
 	PushConvSettings        = "chat.convsettings"
 	PushSubteamRename       = "chat.subteamrename"
 	PushConversationsUpdate = "chat.conversationsupdate"
+
+	MapsDomain = "keybasemaps"
 )
 
 func NewAllCryptKeys() AllCryptKeys {
@@ -84,8 +87,9 @@ type RemoteConversationMetadata struct {
 }
 
 type RemoteConversation struct {
-	Conv          chat1.Conversation          `codec:"c"`
-	LocalMetadata *RemoteConversationMetadata `codec:"l"`
+	Conv           chat1.Conversation          `codec:"c"`
+	LocalMetadata  *RemoteConversationMetadata `codec:"l"`
+	LocalReadMsgID chat1.MessageID             `codec:"r"`
 }
 
 func (rc RemoteConversation) GetMtime() gregor1.Time {
@@ -115,6 +119,13 @@ func (rc RemoteConversation) GetTopicName() string {
 	return ""
 }
 
+func (rc RemoteConversation) GetTLFName() string {
+	if len(rc.Conv.MaxMsgSummaries) == 0 {
+		return ""
+	}
+	return rc.Conv.MaxMsgSummaries[0].TlfName
+}
+
 func (rc RemoteConversation) GetName() string {
 	switch rc.Conv.Metadata.TeamType {
 	case chat1.TeamType_COMPLEX:
@@ -128,6 +139,14 @@ func (rc RemoteConversation) GetName() string {
 		}
 		return rc.Conv.MaxMsgSummaries[0].TlfName
 	}
+}
+
+func (rc RemoteConversation) GetTopicType() chat1.TopicType {
+	return rc.Conv.GetTopicType()
+}
+
+func (rc RemoteConversation) IsLocallyRead() bool {
+	return rc.LocalReadMsgID >= rc.Conv.MaxVisibleMsgID()
 }
 
 type Inbox struct {
@@ -218,7 +237,7 @@ type AttachmentUploadResult struct {
 type BoxerEncryptionInfo struct {
 	Key                   CryptKey
 	SigningKeyPair        libkb.NaclSigningKeyPair
-	EphemeralSeed         *keybase1.TeamEk
+	EphemeralKey          EphemeralCryptKey
 	PairwiseMACRecipients []keybase1.KID
 	Version               chat1.MessageBoxedVersion
 }
@@ -279,6 +298,7 @@ func (d DummyAttachmentFetcher) IsAssetLocal(ctx context.Context, asset chat1.As
 	return false, nil
 }
 func (d DummyAttachmentFetcher) OnDbNuke(mctx libkb.MetaContext) error { return nil }
+func (d DummyAttachmentFetcher) OnStart(mctx libkb.MetaContext)        {}
 
 type DummyAttachmentHTTPSrv struct{}
 
@@ -347,6 +367,12 @@ func (d DummyIndexer) Stop(ctx context.Context) chan struct{} {
 	close(ch)
 	return ch
 }
+func (d DummyIndexer) Suspend(ctx context.Context) bool {
+	return false
+}
+func (d DummyIndexer) Resume(ctx context.Context) bool {
+	return false
+}
 func (d DummyIndexer) Search(ctx context.Context, uid gregor1.UID, query, origQuery string,
 	opts chat1.SearchOpts, hitUICh chan chat1.ChatSearchInboxHit, indexUICh chan chat1.ChatSearchIndexStatus) (*chat1.ChatSearchInboxResults, error) {
 	return nil, nil
@@ -363,9 +389,8 @@ func (d DummyIndexer) SearchableConvs(ctx context.Context, uid gregor1.UID, conv
 func (d DummyIndexer) IndexInbox(ctx context.Context, uid gregor1.UID) (map[string]chat1.ProfileSearchConvStats, error) {
 	return nil, nil
 }
-func (d DummyIndexer) ClearCache() {
-	return
-}
+func (d DummyIndexer) IsBackgroundActive() bool { return false }
+func (d DummyIndexer) ClearCache()              {}
 func (d DummyIndexer) OnLogout(mctx libkb.MetaContext) error {
 	return nil
 }
@@ -478,7 +503,8 @@ func (d DummyCoinFlipManager) MaybeInjectFlipMessage(ctx context.Context, boxedM
 }
 
 func (d DummyCoinFlipManager) LoadFlip(ctx context.Context, uid gregor1.UID, hostConvID chat1.ConversationID,
-	hostMsgID chat1.MessageID, flipConvID chat1.ConversationID, gameID chat1.FlipGameID) {
+	hostMsgID chat1.MessageID, flipConvID chat1.ConversationID, gameID chat1.FlipGameID) (chan chat1.UICoinFlipStatus, chan error) {
+	return nil, nil
 }
 
 func (d DummyCoinFlipManager) DescribeFlipText(ctx context.Context, text string) string { return "" }
@@ -501,6 +527,55 @@ func (d DummyTeamMentionLoader) Stop(ctx context.Context) chan struct{} {
 }
 
 func (d DummyTeamMentionLoader) LoadTeamMention(ctx context.Context, uid gregor1.UID,
-	teamName, channel string) error {
+	maybeMention chat1.MaybeMention, knownTeamMentions []chat1.KnownTeamMention,
+	forceRemote bool) error {
 	return nil
+}
+
+func (d DummyTeamMentionLoader) IsTeamMention(ctx context.Context, uid gregor1.UID,
+	maybeMention chat1.MaybeMention, knownTeamMentions []chat1.KnownTeamMention) bool {
+	return false
+}
+
+type DummyExternalAPIKeySource struct{}
+
+func (d DummyExternalAPIKeySource) GetKey(ctx context.Context, typ chat1.ExternalAPIKeyTyp) (res chat1.ExternalAPIKey, err error) {
+	switch typ {
+	case chat1.ExternalAPIKeyTyp_GIPHY:
+		return chat1.NewExternalAPIKeyWithGiphy(""), nil
+	case chat1.ExternalAPIKeyTyp_GOOGLEMAPS:
+		return chat1.NewExternalAPIKeyWithGooglemaps(""), nil
+	}
+	return res, errors.New("dummy doesnt know about key typ")
+}
+
+func (d DummyExternalAPIKeySource) GetAllKeys(ctx context.Context) (res []chat1.ExternalAPIKey, err error) {
+	return res, nil
+}
+
+type DummyBotCommandManager struct{}
+
+func (d DummyBotCommandManager) Advertise(ctx context.Context, alias *string,
+	ads []chat1.AdvertiseCommandsParam) error {
+	return nil
+}
+
+func (d DummyBotCommandManager) Clear(context.Context) error { return nil }
+
+func (d DummyBotCommandManager) ListCommands(ctx context.Context, convID chat1.ConversationID) ([]chat1.UserBotCommandOutput, error) {
+	return nil, nil
+}
+
+func (d DummyBotCommandManager) UpdateCommands(ctx context.Context, convID chat1.ConversationID,
+	info *chat1.BotInfo) (chan error, error) {
+	ch := make(chan error, 1)
+	ch <- nil
+	return ch, nil
+}
+
+func (d DummyBotCommandManager) Start(ctx context.Context, uid gregor1.UID) {}
+func (d DummyBotCommandManager) Stop(ctx context.Context) chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
 }

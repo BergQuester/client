@@ -186,7 +186,7 @@ func TestImplicitPukless(t *testing.T) {
 	u1Role, err := team.chain().GetUserRole(fus[1].GetUserVersion())
 	require.True(t, err != nil || u1Role == keybase1.TeamRole_NONE, "u1 should not yet be a member")
 	t.Logf("invites: %v", spew.Sdump(team.chain().inner.ActiveInvites))
-	itype, err := keybase1.TeamInviteTypeFromString("keybase", true)
+	itype, err := TeamInviteTypeFromString(tcs[0].MetaContext(), "keybase")
 	require.NoError(t, err, "should be able to make invite type for 'keybase'")
 	invite, err := team.chain().FindActiveInvite(fus[1].GetUserVersion().TeamInviteName(), itype)
 	require.NoError(t, err, "team should have invite for the puk-less user")
@@ -232,7 +232,7 @@ func TestImplicitDisplayTeamNameParse(t *testing.T) {
 	// It will probably fail because <uid>@keybase is the wrong format.
 
 	makeAssertionContext := func() libkb.AssertionContext {
-		return libkb.MakeAssertionContext(externals.NewProofServices(tc.G))
+		return libkb.MakeAssertionContext(libkb.NewMetaContext(context.Background(), tc.G), externals.NewProofServices(tc.G))
 	}
 
 	for _, public := range []bool{true, false} {
@@ -339,7 +339,7 @@ func TestImplicitTeamRotate(t *testing.T) {
 		require.Equal(t, keybase1.PerTeamKeyGeneration(1), team.Generation())
 
 		t.Logf("rotate the key")
-		err = team.Rotate(context.TODO())
+		err = team.Rotate(context.TODO(), keybase1.RotationType_VISIBLE)
 		require.NoError(t, err)
 
 		t.Logf("load as other member")
@@ -572,6 +572,40 @@ func TestReAddMemberWithSameUV(t *testing.T) {
 	// Subsequent calls should start UserHasNotResetErrorin again
 	err = reAddMemberAfterResetInner(context.Background(), tcs[0].G, teamObj.ID, bob.Username)
 	require.IsType(t, UserHasNotResetError{}, err)
+}
+
+func TestBotMember(t *testing.T) {
+	fus, tcs, cleanup := setupNTests(t, 3)
+	defer cleanup()
+
+	ann := fus[0]   // crypto user
+	bob := fus[1]   // crypto user
+	botua := fus[2] // bot user
+
+	impteamName := strings.Join([]string{ann.Username, bob.Username}, ",")
+	t.Logf("ann creates an implicit team: %v", impteamName)
+	teamObj, _, _, err := LookupOrCreateImplicitTeam(context.Background(), tcs[0].G, impteamName, false /*isPublic*/)
+	require.NoError(t, err)
+
+	t.Logf("created team id: %s", teamObj.ID)
+	_, err = AddMemberByID(context.TODO(), tcs[0].G, teamObj.ID, botua.Username, keybase1.TeamRole_RESTRICTEDBOT)
+	require.NoError(t, err)
+	team, err := Load(context.Background(), tcs[2].G, keybase1.LoadTeamArg{ID: teamObj.ID})
+	require.NoError(t, err)
+
+	members, err := team.Members()
+	require.NoError(t, err)
+	require.Len(t, members.RestrictedBots, 1)
+	require.Equal(t, botua.User.GetUID(), members.RestrictedBots[0].Uid)
+
+	err = RemoveMemberByID(context.TODO(), tcs[0].G, teamObj.ID, botua.Username)
+	require.NoError(t, err)
+
+	team, err = Load(context.Background(), tcs[0].G, keybase1.LoadTeamArg{ID: teamObj.ID})
+	require.NoError(t, err)
+	members, err = team.Members()
+	require.NoError(t, err)
+	require.Len(t, members.RestrictedBots, 0)
 }
 
 func TestGetTeamIDRPC(t *testing.T) {

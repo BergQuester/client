@@ -19,6 +19,7 @@ protocol chatUi {
   record UnverifiedInboxUIItemMetadata {
     string channelName;
     string headline;
+    string headlineDecorated;
     string snippet;
     string snippetDecoration; // One of: "", "💣" (bomb), "💥" (exploded)
     array<string> writerNames;
@@ -59,6 +60,20 @@ protocol chatUi {
     boolean offline;
   }
 
+    enum UIParticipantType {
+    NONE_0,
+    USER_1, // Keybase or SBS
+    PHONENO_2,
+    EMAIL_3
+  }
+
+  record UIParticipant {
+    UIParticipantType type;
+    string assertion;
+    union { null, string } fullName;
+    union { null, string } contactName; // if set this is an imptofu conversation with someone in our contacts
+  }
+
   record InboxUIItem {
     string convID;
     TopicType topicType;
@@ -69,9 +84,9 @@ protocol chatUi {
     string snippetDecoration; // One of: "", "💣" (bomb), "💥" (exploded)
     string channel;
     string headline;
+    string headlineDecorated;
     keybase1.TLFVisibility visibility;
-    array<string> participants;
-    map<string, string> fullNames;
+    array<UIParticipant> participants;
     array<string> resetParticipants;
     ConversationStatus status;
     ConversationMembersType membersType;
@@ -94,7 +109,9 @@ protocol chatUi {
     array<ConversationMetadata> supersedes;
     array<ConversationMetadata> supersededBy;
 
+    // Command support
     ConversationCommandGroups commands;
+    ConversationCommandGroups botCommands;
   }
 
   record InboxUIItemError {
@@ -140,6 +157,10 @@ protocol chatUi {
     boolean showCancel;                           // true if cancel is an option for this payment
     string fromUsername;
     string toUsername;
+    // for path payments
+    string sourceAmount;
+    stellar1.Asset sourceAsset;
+    string issuerDescription;
   }
 
   record UIRequestInfo {
@@ -176,7 +197,6 @@ protocol chatUi {
     array<string> atMentions;
     ChannelMention channelMention;
     array<UIChannelNameMention> channelNameMentions;
-    array<MaybeTeamMention> teamMentions;
     boolean isEphemeral;
     boolean isEphemeralExpired;
     union { null, string} explodedBy;
@@ -244,14 +264,37 @@ protocol chatUi {
     PAYMENT_0,
     ATMENTION_1,
     CHANNELNAMEMENTION_2,
-    TEAMMENTION_3
+    MAYBEMENTION_3,
+    LINK_4,
+    MAILTO_5
+  }
+
+  enum UIMaybeMentionStatus {
+    UNKNOWN_0,
+    USER_1,
+    TEAM_2,
+    NOTHING_3
+  }
+
+  record UILinkDecoration {
+    string display;
+    string url;
+  }
+
+  variant UIMaybeMentionInfo switch (UIMaybeMentionStatus status) {
+    case UNKNOWN: void;
+    case USER: void;
+    case TEAM: UITeamMention;
+    case NOTHING: void;
   }
 
   variant UITextDecoration switch (UITextDecorationTyp typ) {
     case PAYMENT: TextPayment;
     case ATMENTION: string;
     case CHANNELNAMEMENTION: UIChannelNameMention;
-    case TEAMMENTION: MaybeTeamMention;
+    case MAYBEMENTION: MaybeMention;
+    case LINK: UILinkDecoration;
+    case MAILTO: UILinkDecoration;
   }
 
   void chatAttachmentDownloadStart(int sessionID);
@@ -398,5 +441,30 @@ protocol chatUi {
   }
   void chatCommandMarkdown(int sessionID, string convID, union { null, UICommandMarkdown } md);
 
-  void chatTeamMentionUpdate(int sessionID, string teamName, string channel, UITeamMention info);
+  void chatMaybeMentionUpdate(int sessionID, string teamName, string channel, UIMaybeMentionInfo info);
+
+  void chatLoadGalleryHit(int sessionID, UIMessage message);
+
+  // Location support
+  @typedef("uint64") @lint("ignore") record LocationWatchID {}
+  LocationWatchID chatWatchPosition(int sessionID, ConversationID convID);
+  void chatClearWatch(int sessionID, LocationWatchID id);
+
+  // Slash command feedback
+  enum UICommandStatusDisplayTyp {
+    STATUS_0,
+    WARNING_1,
+    ERROR_2
+  }
+  enum UICommandStatusActionTyp {
+    APPSETTINGS_0
+  }
+  void chatCommandStatus(int sessionID, string convID, string displayText, UICommandStatusDisplayTyp typ, array<UICommandStatusActionTyp> actions);
+  enum UIBotCommandsUpdateStatus {
+    UPTODATE_0,
+    UPDATING_1,
+    FAILED_2,
+    BLANK_3
+  }
+  void chatBotCommandsUpdateStatus(int sessionID, string convID, UIBotCommandsUpdateStatus status); 
 }

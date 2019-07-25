@@ -26,7 +26,6 @@ import (
 const (
 	updatePointerPrefetchPriority int           = 1
 	prefetchTimeout               time.Duration = 24 * time.Hour
-	maxNumPrefetches              int           = 10000
 	overallSyncStatusInterval     time.Duration = 1 * time.Second
 )
 
@@ -38,6 +37,7 @@ type prefetcherConfig interface {
 	diskBlockCacheGetter
 	clockGetter
 	reporterGetter
+	settingsDBGetter
 }
 
 type prefetchRequest struct {
@@ -73,6 +73,7 @@ const (
 type prefetch struct {
 	subtreeBlockCount int
 	subtreeTriggered  bool
+	subtreeRetrigger  bool
 	req               *prefetchRequest
 	// Each refnonce for this block ID can have a different set of
 	// parents.  Track the channel for the specific instance of the
@@ -610,6 +611,14 @@ func (p *blockPrefetcher) calculatePriority(
 	return basePriority - 1
 }
 
+// removeFinishedParent removes a parent from the given refmap if it's
+// finished or is otherwise no longer a prefetch in progress.
+func (p *blockPrefetcher) removeFinishedParent(
+	pptr data.BlockPointer, refMap map[data.BlockPointer]<-chan struct{},
+	ch <-chan struct{}) {
+	_ = p.getParentForApply(pptr, refMap, ch)
+}
+
 // request maps the parent->child block relationship in the prefetcher, and it
 // triggers child prefetches that aren't already in progress.
 func (p *blockPrefetcher) request(ctx context.Context, priority int,
@@ -634,13 +643,14 @@ func (p *blockPrefetcher) request(ctx context.Context, priority int,
 		req := &prefetchRequest{
 			ptr, info.EncodedSize, block.NewEmptier(), kmd, priority,
 			lifetime, NoPrefetch, action, nil, obseleted, false}
+
 		pre = p.newPrefetch(1, uint64(info.EncodedSize), false, req)
 		p.prefetches[ptr.ID] = pre
 	}
 	// If this is a new prefetch, or if we need to update the action,
 	// send a new request.
 	newAction := action.Combine(pre.req.action)
-	if !isPrefetchWaiting || pre.req.action != newAction {
+	if !isPrefetchWaiting || pre.req.action != newAction || pre.req.ptr != ptr {
 		// Update the action to prevent any early cancellation of a
 		// previous, non-deeply-synced request, and trigger a new
 		// request in case the previous request has already been
@@ -649,6 +659,16 @@ func (p *blockPrefetcher) request(ctx context.Context, priority int,
 		pre.req.action = newAction
 		if !oldAction.Sync() && newAction.Sync() {
 			p.incOverallSyncTotalBytes(pre.req)
+			// Delete the old parent waitCh if it's been canceled already.
+			if ch, ok := pre.parents[ptr.RefNonce][parentPtr]; ok {
+				p.removeFinishedParent(parentPtr, pre.parents[ptr.RefNonce], ch)
+			}
+			if pre.subtreeTriggered {
+				// Since this fetch is being converted into a sync, we
+				// need to re-trigger all the child fetches to be
+				// syncs as well.
+				pre.subtreeRetrigger = true
+			}
 		}
 
 		ch := p.retriever.Request(
@@ -899,7 +919,7 @@ func (p *blockPrefetcher) reschedulePrefetch(req *prefetchRequest) {
 	}
 }
 
-func (p *blockPrefetcher) sendOutOfSpaceNotification() {
+func (p *blockPrefetcher) sendOverallSyncStatusNotification() {
 	p.overallSyncStatusLock.Lock()
 	defer p.overallSyncStatusLock.Unlock()
 	p.sendOverallSyncStatusHelperLocked()
@@ -911,12 +931,22 @@ func (p *blockPrefetcher) stopIfNeeded(
 	if dbc == nil {
 		return false, false
 	}
-	hasRoom, err := dbc.DoesCacheHaveSpace(ctx, req.action.CacheType())
+	hasRoom, howMuchRoom, err := dbc.DoesCacheHaveSpace(ctx, req.action.CacheType())
 	if err != nil {
 		p.log.CDebugf(ctx, "Error checking space: +%v", err)
 		return false, false
 	}
 	if hasRoom {
+		db := p.config.GetSettingsDB()
+		if db != nil {
+			if settings, err := db.Settings(ctx); err == nil &&
+				req.action.CacheType() == DiskBlockSyncCache &&
+				howMuchRoom < settings.SpaceAvailableNotificationThreshold {
+				// If a notification threshold is configured, we send a
+				// notificaiton here.
+				p.sendOverallSyncStatusNotification()
+			}
+		}
 		return false, false
 	}
 
@@ -931,7 +961,7 @@ func (p *blockPrefetcher) stopIfNeeded(
 	if req.action.Sync() {
 		// If the sync cache is close to full, reschedule the prefetch.
 		p.reschedulePrefetch(req)
-		p.sendOutOfSpaceNotification()
+		p.sendOverallSyncStatusNotification()
 		return true, false
 	}
 
@@ -977,7 +1007,7 @@ func (p *blockPrefetcher) handlePrefetchRequest(req *prefetchRequest) {
 		// This request was cancelled while it was waiting.
 		p.vlog.CLogf(context.Background(), libkb.VLog2,
 			"Request not processing because it was canceled already"+
-				": id=%v action=%v", req.ptr.ID, req.action)
+				": ptr=%s action=%v", req.ptr, req.action)
 		return
 	default:
 		p.markQueuedPrefetchDone(req.ptr)
@@ -1118,7 +1148,12 @@ func (p *blockPrefetcher) handlePrefetchRequest(req *prefetchRequest) {
 	}
 
 	if isPrefetchWaiting {
-		if pre.subtreeTriggered {
+		if pre.subtreeRetrigger {
+			p.vlog.CLogf(
+				ctx, libkb.VLog2,
+				"retriggering prefetch subtree for block ID %s", req.ptr.ID)
+			pre.subtreeRetrigger = false
+		} else if pre.subtreeTriggered {
 			p.vlog.CLogf(
 				ctx, libkb.VLog2, "prefetch subtree already triggered "+
 					"for block ID %s", req.ptr.ID)
@@ -1221,7 +1256,7 @@ func (p *blockPrefetcher) handlePrefetchRequest(req *prefetchRequest) {
 	}
 	if !isPrefetchWaiting {
 		p.vlog.CLogf(ctx, libkb.VLog2,
-			"adding block %s to the prefetch tree", req.ptr.ID)
+			"adding block %s to the prefetch tree", req.ptr)
 		// This block doesn't appear in the prefetch tree, so it's the
 		// root of a new prefetch tree. Add it to the tree.
 		p.prefetches[req.ptr.ID] = pre
@@ -1419,7 +1454,6 @@ func (p *blockPrefetcher) triggerPrefetch(req *prefetchRequest) {
 		p.log.Warning("Skipping prefetch for block %v since "+
 			"the prefetcher is shutdown", req.ptr.ID)
 	}
-	return
 }
 
 func (p *blockPrefetcher) cacheOrCancelPrefetch(ctx context.Context,

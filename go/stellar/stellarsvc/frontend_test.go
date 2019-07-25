@@ -54,6 +54,8 @@ func TestGetWalletAccountsLocal(t *testing.T) {
 	require.Equal(t, "qq", accts[0].Name)
 	require.Equal(t, stellar1.AccountMode_USER, accts[0].AccountMode)
 	require.Equal(t, false, accts[0].AccountModeEditable)
+	require.Equal(t, false, accts[0].DeviceReadOnly)
+	require.True(t, accts[0].CanAddTrustline)
 	require.Equal(t, "10,000.00 XLM", accts[0].BalanceDescription)
 	currencyLocal := accts[0].CurrencyLocal
 	require.Equal(t, stellar1.OutsideCurrencyCode("USD"), currencyLocal.Code)
@@ -66,7 +68,9 @@ func TestGetWalletAccountsLocal(t *testing.T) {
 	require.Equal(t, firstAccountName(t, tcs[0]), accts[1].Name)
 	require.Equal(t, stellar1.AccountMode_USER, accts[1].AccountMode)
 	require.Equal(t, false, accts[1].AccountModeEditable)
+	require.Equal(t, false, accts[1].DeviceReadOnly)
 	require.Equal(t, "0 XLM", accts[1].BalanceDescription)
+	require.False(t, accts[1].CanAddTrustline)
 	currencyLocal = accts[1].CurrencyLocal
 	require.Equal(t, stellar1.OutsideCurrencyCode("USD"), currencyLocal.Code)
 	require.NotEmpty(t, accts[1].Seqno)
@@ -78,6 +82,7 @@ func TestGetWalletAccountsLocal(t *testing.T) {
 	require.Equal(t, "qq", details.Name)
 	require.Equal(t, stellar1.AccountMode_USER, details.AccountMode)
 	require.Equal(t, false, accts[1].AccountModeEditable)
+	require.Equal(t, false, accts[1].DeviceReadOnly)
 	require.True(t, details.IsDefault)
 	require.Equal(t, "10,000.00 XLM", details.BalanceDescription)
 	require.NotEmpty(t, details.Seqno)
@@ -85,6 +90,7 @@ func TestGetWalletAccountsLocal(t *testing.T) {
 	require.Equal(t, stellar1.OutsideCurrencyCode("USD"), currencyLocal.Code)
 	require.True(t, details.IsFunded)
 	require.True(t, details.CanSubmitTx)
+	require.True(t, details.CanAddTrustline)
 
 	argDetails.AccountID = accts[1].AccountID
 	details, err = tcs[0].Srv.GetWalletAccountLocal(context.Background(), argDetails)
@@ -97,6 +103,7 @@ func TestGetWalletAccountsLocal(t *testing.T) {
 	require.Equal(t, stellar1.OutsideCurrencyCode("USD"), currencyLocal.Code)
 	require.False(t, details.IsFunded)
 	require.False(t, details.CanSubmitTx)
+	require.False(t, details.CanAddTrustline)
 
 	// Add another account that we will add 1 XLM, enough to be funded but not
 	// enough to make any txs out of it.
@@ -117,6 +124,26 @@ func TestGetWalletAccountsLocal(t *testing.T) {
 	require.True(t, details.IsFunded)
 	require.False(t, details.CanSubmitTx)
 	require.Equal(t, stellar1.OutsideCurrencyCode("USD"), details.CurrencyLocal.Code)
+	require.False(t, details.CanAddTrustline)
+
+	// Add another account that we will add 10 XLM, enough to be funded and can create trustlines
+	yetAnotherAccountID := tcs[0].Backend.AddAccountEmpty(t)
+	err = tcs[0].Srv.ImportSecretKeyLocal(context.Background(), stellar1.ImportSecretKeyLocalArg{
+		SecretKey:   tcs[0].Backend.SecretKey(yetAnotherAccountID),
+		MakePrimary: false,
+		Name:        "another funded but 0 avail.",
+	})
+	require.NoError(t, err)
+
+	tcs[0].Backend.Gift(yetAnotherAccountID, "10")
+	argDetails.AccountID = yetAnotherAccountID
+	details, err = tcs[0].Srv.GetWalletAccountLocal(context.Background(), argDetails)
+	require.NoError(t, err)
+	require.Equal(t, "10 XLM", details.BalanceDescription)
+	require.True(t, details.IsFunded)
+	require.True(t, details.CanSubmitTx)
+	require.Equal(t, stellar1.OutsideCurrencyCode("USD"), details.CurrencyLocal.Code)
+	require.True(t, details.CanAddTrustline)
 }
 
 func TestGetAccountAssetsLocalWithBalance(t *testing.T) {
@@ -166,11 +193,12 @@ func TestGetAccountAssetsLocalWithCHFBalance(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
+	curr, err := tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
 		AccountID: accountID,
 		Currency:  stellar1.OutsideCurrencyCode("CHF"),
 	})
 	require.NoError(t, err)
+	require.Equal(t, stellar1.OutsideCurrencyCode("CHF"), curr.Code)
 
 	tcs[0].Backend.ImportAccountsForUser(tcs[0])
 
@@ -324,11 +352,12 @@ func TestChangeWalletName(t *testing.T) {
 	chk("", "name required")
 	chk("office lunch money", "")
 	chk("savings", "")
-	err = tcs[0].Srv.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
+	res, err := tcs[0].Srv.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
 		AccountID: accs[0].AccountID,
 		NewName:   "office lunch money",
 	})
 	require.NoError(t, err)
+	require.Equal(t, "office lunch money", res.Name)
 	chk("office lunch money", "you already have an account with that name")
 	chk("career debter", "")
 
@@ -344,7 +373,7 @@ func TestChangeWalletName(t *testing.T) {
 
 	// Try invalid argument
 	invalidAccID, _ := randomStellarKeypair()
-	err = tcs[0].Srv.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
+	_, err = tcs[0].Srv.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
 		AccountID: invalidAccID,
 		NewName:   "savings",
 	})
@@ -371,10 +400,11 @@ func TestSetAccountAsDefault(t *testing.T) {
 
 	// Should work for accounts that are already primary and not post
 	// a bundle.
-	err = tcs[0].Srv.SetWalletAccountAsDefaultLocal(context.Background(), stellar1.SetWalletAccountAsDefaultLocalArg{
+	res, err := tcs[0].Srv.SetWalletAccountAsDefaultLocal(context.Background(), stellar1.SetWalletAccountAsDefaultLocalArg{
 		AccountID: accs[0].AccountID,
 	})
 	require.NoError(t, err)
+	require.Equal(t, accs[0].AccountID, res[0].AccountID)
 
 	mctx := libkb.NewMetaContextBackground(tcs[0].G)
 	bundle, err := remote.FetchSecretlessBundle(mctx)
@@ -383,12 +413,12 @@ func TestSetAccountAsDefault(t *testing.T) {
 
 	// Test invalid arguments
 	invalidAccID, _ := randomStellarKeypair()
-	err = tcs[0].Srv.SetWalletAccountAsDefaultLocal(context.Background(), stellar1.SetWalletAccountAsDefaultLocalArg{
+	_, err = tcs[0].Srv.SetWalletAccountAsDefaultLocal(context.Background(), stellar1.SetWalletAccountAsDefaultLocalArg{
 		AccountID: invalidAccID,
 	})
 	require.Error(t, err)
 
-	err = tcs[0].Srv.SetWalletAccountAsDefaultLocal(context.Background(), stellar1.SetWalletAccountAsDefaultLocalArg{
+	_, err = tcs[0].Srv.SetWalletAccountAsDefaultLocal(context.Background(), stellar1.SetWalletAccountAsDefaultLocalArg{
 		AccountID: stellar1.AccountID(""),
 	})
 	require.Error(t, err)
@@ -412,7 +442,7 @@ func TestSetAccountAsDefault(t *testing.T) {
 		arg := stellar1.SetWalletAccountAsDefaultLocalArg{
 			AccountID: v,
 		}
-		err := tcs[0].Srv.SetWalletAccountAsDefaultLocal(context.Background(), arg)
+		_, err := tcs[0].Srv.SetWalletAccountAsDefaultLocal(context.Background(), arg)
 		require.NoError(t, err)
 
 		accs, err := tcs[0].Srv.WalletGetAccountsCLILocal(context.Background())
@@ -548,14 +578,14 @@ func TestChangeDisplayCurrency(t *testing.T) {
 	accID := getPrimaryAccountID(tcs[0])
 
 	// Try invalid currency first.
-	err := tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
+	_, err := tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
 		AccountID: accID,
 		Currency:  stellar1.OutsideCurrencyCode("ZZZ"),
 	})
 	require.Error(t, err)
 
 	// Try empty account id.
-	err = tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
+	_, err = tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
 		AccountID: stellar1.AccountID(""),
 		Currency:  stellar1.OutsideCurrencyCode("USD"),
 	})
@@ -563,7 +593,7 @@ func TestChangeDisplayCurrency(t *testing.T) {
 
 	// Try non-existant account id.
 	invalidAccID, _ := randomStellarKeypair()
-	err = tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
+	_, err = tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
 		AccountID: invalidAccID,
 		Currency:  stellar1.OutsideCurrencyCode("USD"),
 	})
@@ -574,18 +604,19 @@ func TestChangeDisplayCurrency(t *testing.T) {
 	acceptDisclaimer(tcs[1])
 	tcs[1].Backend.ImportAccountsForUser(tcs[1])
 	accID2 := getPrimaryAccountID(tcs[1])
-	err = tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
+	_, err = tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
 		AccountID: accID2,
 		Currency:  stellar1.OutsideCurrencyCode("EUR"),
 	})
 	require.Error(t, err)
 
 	// Finally, a happy path.
-	err = tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
+	res, err := tcs[0].Srv.ChangeDisplayCurrencyLocal(context.Background(), stellar1.ChangeDisplayCurrencyLocalArg{
 		AccountID: accID,
 		Currency:  stellar1.OutsideCurrencyCode("EUR"),
 	})
 	require.NoError(t, err)
+	require.Equal(t, stellar1.OutsideCurrencyCode("EUR"), res.Code)
 
 	// Check both CLI and Frontend RPCs.
 	accs, err := tcs[0].Srv.WalletGetAccountsCLILocal(context.Background())
@@ -710,7 +741,7 @@ func TestGetPaymentsLocal(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = srvSender.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
+	_, err = srvSender.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
 		AccountID: accountIDSender,
 		NewName:   "office lunch money",
 	})
@@ -890,7 +921,8 @@ func TestGetPaymentsLocal(t *testing.T) {
 	}
 
 	// check the details
-	checkPaymentDetails := func(p stellar1.PaymentDetailsLocal, sender bool) {
+	checkPaymentDetails := func(pd stellar1.PaymentDetailsLocal, sender bool) {
+		p := pd.Summary
 		require.NotEmpty(t, p.Id)
 		require.NotZero(t, p.Time)
 		require.Equal(t, stellar1.PaymentStatus_COMPLETED, p.StatusSimplified)
@@ -926,10 +958,10 @@ func TestGetPaymentsLocal(t *testing.T) {
 
 		require.Equal(t, "here you go", p.Note)
 		require.Empty(t, p.NoteErr)
-		require.Equal(t, "public note", p.PublicNote)
-		require.Equal(t, "text", p.PublicNoteType)
+		require.Equal(t, "public note", pd.Details.PublicNote)
+		require.Equal(t, "text", pd.Details.PublicNoteType)
 		t.Logf("details: %+v", p)
-		require.Equal(t, fmt.Sprintf("https://stellar.expert/explorer/public/tx/%s", p.TxID), p.ExternalTxURL)
+		require.Equal(t, fmt.Sprintf("https://stellar.expert/explorer/public/tx/%s", p.TxID), pd.Details.ExternalTxURL)
 	}
 	details, err := srvSender.GetPaymentDetailsLocal(context.Background(), stellar1.GetPaymentDetailsLocalArg{
 		Id:        senderPayments[0].Payment.Id,
@@ -1036,7 +1068,7 @@ func TestSendToSelf(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = tcs[0].Srv.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
+	_, err = tcs[0].Srv.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
 		AccountID: accountID1,
 		NewName:   "office lunch money",
 	})
@@ -1048,7 +1080,7 @@ func TestSendToSelf(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = tcs[0].Srv.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
+	_, err = tcs[0].Srv.ChangeWalletAccountNameLocal(context.Background(), stellar1.ChangeWalletAccountNameLocalArg{
 		AccountID: accountID2,
 		NewName:   "savings",
 	})
@@ -1136,10 +1168,11 @@ func TestSendToSelf(t *testing.T) {
 	require.Equal(t, "", p.ToAssertion)
 	require.Equal(t, "$123.23 USD", p.WorthAtSendTime)
 
-	pd, err := tcs[0].Srv.GetPaymentDetailsLocal(context.Background(), stellar1.GetPaymentDetailsLocalArg{
+	pd1, err := tcs[0].Srv.GetPaymentDetailsLocal(context.Background(), stellar1.GetPaymentDetailsLocalArg{
 		Id:        page.Payments[2].Payment.Id,
 		AccountID: accountID1,
 	})
+	pd := pd1.Summary
 	require.NoError(t, err)
 	require.Equal(t, "100 XLM", pd.AmountDescription)
 	require.Equal(t, stellar1.ParticipantType_OWNACCOUNT, pd.FromType)
@@ -1153,10 +1186,11 @@ func TestSendToSelf(t *testing.T) {
 	require.Equal(t, "", pd.ToAssertion)
 	require.Equal(t, "$123.23 USD", p.WorthAtSendTime)
 
-	pd, err = tcs[0].Srv.GetPaymentDetailsLocal(context.Background(), stellar1.GetPaymentDetailsLocalArg{
+	pd1, err = tcs[0].Srv.GetPaymentDetailsLocal(context.Background(), stellar1.GetPaymentDetailsLocalArg{
 		Id:        page.Payments[1].Payment.Id,
 		AccountID: accountID1,
 	})
+	pd = pd1.Summary
 	require.NoError(t, err)
 	require.Equal(t, "200 XLM", pd.AmountDescription)
 	require.Equal(t, stellar1.ParticipantType_OWNACCOUNT, pd.FromType)
@@ -1170,10 +1204,11 @@ func TestSendToSelf(t *testing.T) {
 	require.Equal(t, "", pd.ToAssertion)
 	require.Equal(t, "$123.23 USD", p.WorthAtSendTime)
 
-	pd, err = tcs[0].Srv.GetPaymentDetailsLocal(context.Background(), stellar1.GetPaymentDetailsLocalArg{
+	pd1, err = tcs[0].Srv.GetPaymentDetailsLocal(context.Background(), stellar1.GetPaymentDetailsLocalArg{
 		Id:        page.Payments[0].Payment.Id,
 		AccountID: accountID2,
 	})
+	pd = pd1.Summary
 	require.NoError(t, err)
 	require.Equal(t, "300 XLM", pd.AmountDescription)
 	require.Equal(t, stellar1.ParticipantType_OWNACCOUNT, pd.FromType)
@@ -1231,12 +1266,12 @@ func TestPaymentDetailsEmptyAccId(t *testing.T) {
 		Id: paymentID,
 	})
 	require.NoError(t, err)
-	require.Equal(t, stellar1.BalanceDelta_NONE, detailsRes.Delta)
-	require.Equal(t, "505.6120000 XLM", detailsRes.AmountDescription)
-	require.Equal(t, "$160.93 USD", detailsRes.Worth)
-	require.Equal(t, "", detailsRes.WorthAtSendTime)
-	require.Equal(t, secretNote, detailsRes.Note)
-	require.Equal(t, "", detailsRes.NoteErr)
+	require.Equal(t, stellar1.BalanceDelta_NONE, detailsRes.Summary.Delta)
+	require.Equal(t, "505.6120000 XLM", detailsRes.Summary.AmountDescription)
+	require.Equal(t, "$160.93 USD", detailsRes.Summary.Worth)
+	require.Equal(t, "", detailsRes.Summary.WorthAtSendTime)
+	require.Equal(t, secretNote, detailsRes.Summary.Note)
+	require.Equal(t, "", detailsRes.Summary.NoteErr)
 }
 
 func TestBuildRequestLocal(t *testing.T) {
@@ -1443,6 +1478,29 @@ func TestBuildPaymentLocal(t *testing.T) {
 		Message: fmt.Sprintf("Because it's %v's first transaction, you must send at least 1 XLM.", tcs[1].Fu.Username),
 	}})
 
+	bres, err = tcs[0].Srv.BuildPaymentLocal(context.Background(), stellar1.BuildPaymentLocalArg{
+		From:     senderAccountID,
+		To:       tcs[1].Fu.Username,
+		Amount:   "30",
+		Currency: &usd,
+	})
+	require.NoError(t, err)
+	t.Logf(spew.Sdump(bres))
+	require.Equal(t, false, bres.ReadyToReview)
+	require.Equal(t, "", bres.ToErrMsg)
+	require.Equal(t, "You have *$0.00 USD* worth of Lumens available to send.", bres.AmountErrMsg)
+	require.Equal(t, "", bres.SecretNoteErrMsg)
+	require.Equal(t, "", bres.PublicMemoErrMsg)
+	require.Equal(t, "94.2424166 XLM", bres.WorthDescription)
+	require.Equal(t, worthInfo, bres.WorthInfo)
+	require.False(t, bres.SendingIntentionXLM)
+	require.Equal(t, "94.2424166 XLM", bres.DisplayAmountXLM)
+	require.Equal(t, "$30.00 USD", bres.DisplayAmountFiat)
+	requireBannerSet(t, bres.DeepCopy().Banners, []stellar1.SendBannerLocal{{
+		Level:   "info",
+		Message: fmt.Sprintf("Because it's %v's first transaction, you must send at least 1 XLM.", tcs[1].Fu.Username),
+	}})
+
 	tcs[0].Backend.ImportAccountsForUser(tcs[0])
 	tcs[0].Backend.Gift(senderAccountID, "20")
 	tcs[0].Backend.Gift(senderSecondaryAccountID, "30")
@@ -1460,7 +1518,7 @@ func TestBuildPaymentLocal(t *testing.T) {
 	t.Logf(spew.Sdump(bres))
 	require.Equal(t, false, bres.ReadyToReview)
 	require.Equal(t, "", bres.ToErrMsg)
-	require.Equal(t, "You have *18.9999900 XLM* available to send.", bres.AmountErrMsg)
+	require.Equal(t, "You only have *18.9999900 XLM* available to send.", bres.AmountErrMsg)
 	require.Equal(t, "", bres.SecretNoteErrMsg)
 	require.Equal(t, "", bres.PublicMemoErrMsg)
 	require.Equal(t, "$9.55 USD", bres.WorthDescription)
@@ -1487,7 +1545,7 @@ func TestBuildPaymentLocal(t *testing.T) {
 	t.Logf(spew.Sdump(bres))
 	require.Equal(t, false, bres.ReadyToReview)
 	require.Equal(t, "", bres.ToErrMsg)
-	require.Equal(t, "You have *$6.04 USD* available to send.", bres.AmountErrMsg)
+	require.Equal(t, "You only have *$6.04 USD* worth of Lumens available to send.", bres.AmountErrMsg)
 	require.Equal(t, "", bres.SecretNoteErrMsg)
 	require.Equal(t, "", bres.PublicMemoErrMsg)
 	require.Equal(t, "19.0055540 XLM", bres.WorthDescription)
@@ -1600,7 +1658,7 @@ func TestBuildPaymentLocal(t *testing.T) {
 	t.Logf(spew.Sdump(bres))
 	require.Equal(t, false, bres.ReadyToReview)
 	require.Equal(t, "", bres.ToErrMsg)
-	require.Equal(t, "You have *3.9999800 XLM* available to send.", bres.AmountErrMsg)
+	require.Equal(t, "You only have *3.9999800 XLM* available to send.", bres.AmountErrMsg)
 	require.Equal(t, "", bres.SecretNoteErrMsg)
 	require.Equal(t, "Memo is too long.", bres.PublicMemoErrMsg) // too many potatoes
 	require.Equal(t, "$4.77 USD", bres.WorthDescription)
@@ -1632,7 +1690,7 @@ func TestBuildPaymentLocal(t *testing.T) {
 	t.Logf(spew.Sdump(bres))
 	require.Equal(t, false, bres.ReadyToReview)
 	require.Equal(t, "", bres.ToErrMsg)
-	require.Equal(t, "You have *3.9999800 XLM* available to send.", bres.AmountErrMsg)
+	require.Equal(t, "You only have *3.9999800 XLM* available to send.", bres.AmountErrMsg)
 	require.Equal(t, "", bres.SecretNoteErrMsg)
 	require.Equal(t, "", bres.PublicMemoErrMsg)
 	require.Equal(t, "$1.27 USD", bres.WorthDescription)
@@ -1808,6 +1866,133 @@ func TestBuildPaymentLocal(t *testing.T) {
 	requireBannerSet(t, bres.DeepCopy().Banners, []stellar1.SendBannerLocal{})
 }
 
+func TestBuildPaymentLocalAdvancedBanner(t *testing.T) {
+	tcs, cleanup := setupNTests(t, 4)
+	defer cleanup()
+
+	acceptDisclaimer(tcs[0])
+	acceptDisclaimer(tcs[1])
+	acceptDisclaimer(tcs[2])
+	acceptDisclaimer(tcs[3])
+	fakeAcct := tcs[0].Backend.ImportAccountsForUser(tcs[0])[0]
+	fakeAcct2 := tcs[1].Backend.ImportAccountsForUser(tcs[1])[0]
+	fakeAcct3 := tcs[2].Backend.ImportAccountsForUser(tcs[2])[0]
+	fakeAcct4 := tcs[3].Backend.ImportAccountsForUser(tcs[3])[0]
+	tcs[0].Backend.Gift(fakeAcct.accountID, "100")
+	tcs[0].Backend.Gift(fakeAcct2.accountID, "100")
+	tcs[0].Backend.Gift(fakeAcct3.accountID, "100")
+	tcs[0].Backend.Gift(fakeAcct4.accountID, "100")
+
+	err := tcs[0].Srv.walletState.Refresh(tcs[0].MetaContext(), fakeAcct.accountID, "test")
+	require.NoError(t, err)
+	err = tcs[1].Srv.walletState.Refresh(tcs[1].MetaContext(), fakeAcct2.accountID, "test")
+	require.NoError(t, err)
+	err = tcs[2].Srv.walletState.Refresh(tcs[2].MetaContext(), fakeAcct3.accountID, "test")
+	require.NoError(t, err)
+	err = tcs[3].Srv.walletState.Refresh(tcs[3].MetaContext(), fakeAcct4.accountID, "test")
+	require.NoError(t, err)
+
+	t.Logf("sending from one account to another that only have native assets")
+	bres, err := tcs[0].Srv.BuildPaymentLocal(context.Background(), stellar1.BuildPaymentLocalArg{
+		From:          fakeAcct.accountID,
+		To:            fakeAcct2.accountID.String(),
+		ToIsAccountID: true,
+		Amount:        "8.50",
+		Currency:      &usd,
+	})
+	require.NoError(t, err)
+	t.Logf(spew.Sdump(bres))
+	require.Equal(t, true, bres.ReadyToReview)
+	require.Equal(t, "", bres.ToErrMsg)
+	require.Equal(t, "", bres.AmountErrMsg)
+	require.Equal(t, "", bres.SecretNoteErrMsg)
+	require.Equal(t, "", bres.PublicMemoErrMsg)
+	require.Equal(t, "26.7020180 XLM", bres.WorthDescription)
+	require.False(t, bres.SendingIntentionXLM)
+	require.Equal(t, "26.7020180 XLM", bres.DisplayAmountXLM)
+	require.Equal(t, "$8.50 USD", bres.DisplayAmountFiat)
+	requireBannerSet(t, bres.DeepCopy().Banners, []stellar1.SendBannerLocal{})
+
+	t.Logf("sending from an account with non-native assets to an account with only native assets")
+	astro := tcs[0].Backend.CreateFakeAsset("AstroDollars")
+	fakeAcct.AdjustAssetBalance(0, astro)
+	err = tcs[0].Srv.walletState.Refresh(tcs[0].MetaContext(), fakeAcct.accountID, "test")
+	require.NoError(t, err)
+	bres, err = tcs[0].Srv.BuildPaymentLocal(context.Background(), stellar1.BuildPaymentLocalArg{
+		From:          fakeAcct.accountID,
+		To:            fakeAcct3.accountID.String(),
+		ToIsAccountID: true,
+		Amount:        "8.50",
+		Currency:      &usd,
+	})
+	require.NoError(t, err)
+	t.Logf(spew.Sdump(bres))
+	require.Equal(t, true, bres.ReadyToReview)
+	require.Equal(t, "", bres.ToErrMsg)
+	require.Equal(t, "", bres.AmountErrMsg)
+	require.Equal(t, "", bres.SecretNoteErrMsg)
+	require.Equal(t, "", bres.PublicMemoErrMsg)
+	require.Equal(t, "26.7020180 XLM", bres.WorthDescription)
+	require.False(t, bres.SendingIntentionXLM)
+	require.Equal(t, "26.7020180 XLM", bres.DisplayAmountXLM)
+	require.Equal(t, "$8.50 USD", bres.DisplayAmountFiat)
+	requireBannerSet(t, bres.DeepCopy().Banners, []stellar1.SendBannerLocal{{
+		Level:                 "info",
+		OfferAdvancedSendForm: stellar1.AdvancedBanner_SENDER_BANNER,
+	}})
+
+	t.Logf("sending from an account with only native assets to an account with non-native assets")
+	bres, err = tcs[2].Srv.BuildPaymentLocal(context.Background(), stellar1.BuildPaymentLocalArg{
+		From:          fakeAcct3.accountID,
+		To:            fakeAcct.accountID.String(),
+		ToIsAccountID: true,
+		Amount:        "8.50",
+		Currency:      &usd,
+	})
+	require.NoError(t, err)
+	t.Logf(spew.Sdump(bres))
+	require.Equal(t, true, bres.ReadyToReview)
+	require.Equal(t, "", bres.ToErrMsg)
+	require.Equal(t, "", bres.AmountErrMsg)
+	require.Equal(t, "", bres.SecretNoteErrMsg)
+	require.Equal(t, "", bres.PublicMemoErrMsg)
+	require.Equal(t, "26.7020180 XLM", bres.WorthDescription)
+	require.False(t, bres.SendingIntentionXLM)
+	require.Equal(t, "26.7020180 XLM", bres.DisplayAmountXLM)
+	require.Equal(t, "$8.50 USD", bres.DisplayAmountFiat)
+	requireBannerSet(t, bres.DeepCopy().Banners, []stellar1.SendBannerLocal{{
+		Level:                 "info",
+		OfferAdvancedSendForm: stellar1.AdvancedBanner_RECEIVER_BANNER,
+	}})
+
+	t.Logf("sending from an account with non-native assets to an account with the same non-native asset")
+	fakeAcct4.AdjustAssetBalance(0, astro)
+	err = tcs[3].Srv.walletState.Refresh(tcs[3].MetaContext(), fakeAcct4.accountID, "test")
+	require.NoError(t, err)
+	bres, err = tcs[0].Srv.BuildPaymentLocal(context.Background(), stellar1.BuildPaymentLocalArg{
+		From:          fakeAcct.accountID,
+		To:            fakeAcct4.accountID.String(),
+		ToIsAccountID: true,
+		Amount:        "8.50",
+		Currency:      &usd,
+	})
+	require.NoError(t, err)
+	t.Logf(spew.Sdump(bres))
+	require.Equal(t, true, bres.ReadyToReview)
+	require.Equal(t, "", bres.ToErrMsg)
+	require.Equal(t, "", bres.AmountErrMsg)
+	require.Equal(t, "", bres.SecretNoteErrMsg)
+	require.Equal(t, "", bres.PublicMemoErrMsg)
+	require.Equal(t, "26.7020180 XLM", bres.WorthDescription)
+	require.False(t, bres.SendingIntentionXLM)
+	require.Equal(t, "26.7020180 XLM", bres.DisplayAmountXLM)
+	require.Equal(t, "$8.50 USD", bres.DisplayAmountFiat)
+	requireBannerSet(t, bres.DeepCopy().Banners, []stellar1.SendBannerLocal{{
+		Level:                 "info",
+		OfferAdvancedSendForm: stellar1.AdvancedBanner_RECEIVER_BANNER,
+	}})
+}
+
 // Simple happy path case.
 func TestBuildPaymentLocalBidHappy(t *testing.T) {
 	testBuildPaymentLocalBidHappy(t, false)
@@ -1885,6 +2070,7 @@ func reviewPaymentExpectQuickSuccess(t testing.TB, tc *TestContext, arg stellar1
 		mockUI.PaymentReviewedHandler = original
 	}()
 	reviewSuccessCh := make(chan struct{}, 1)
+	reviewExitedCh := make(chan struct{}, 1)
 	mockUI.PaymentReviewedHandler = func(ctx context.Context, notification stellar1.PaymentReviewedArg) error {
 		assert.Equal(t, arg.Bid, notification.Msg.Bid)
 		// Allow the not-following warning banner.
@@ -1915,11 +2101,17 @@ func reviewPaymentExpectQuickSuccess(t testing.TB, tc *TestContext, arg stellar1
 	go func() {
 		err := tc.Srv.ReviewPaymentLocal(context.Background(), arg)
 		assert.NoError(t, err) // Use 'assert' since 'require' can only be used from the main goroutine.
+		reviewExitedCh <- struct{}{}
 	}()
 	select {
 	case <-timeoutCh:
 		assert.Fail(t, "timed out")
 	case <-reviewSuccessCh:
+	}
+	select {
+	case <-timeoutCh:
+		assert.Fail(t, "timed out")
+	case <-reviewExitedCh:
 	}
 	t.Logf("review ran for %v", time.Since(start))
 	check(t)
@@ -2210,11 +2402,15 @@ func TestBuildPaymentLocalBidBlocked(t *testing.T) {
 	defer cleanup()
 
 	acceptDisclaimer(tcs[0])
+	acceptDisclaimer(tcs[1])
 	senderAccountID, err := stellar.GetOwnPrimaryAccountID(tcs[0].MetaContext())
 	require.NoError(t, err)
 	tcs[0].Backend.ImportAccountsForUser(tcs[0])
 	tcs[0].Backend.Gift(senderAccountID, "100")
 	err = tcs[0].Srv.walletState.Refresh(tcs[0].MetaContext(), senderAccountID, "test")
+	require.NoError(t, err)
+	fakeAcct := tcs[1].Backend.ImportAccountsForUser(tcs[1])[0]
+	err = tcs[1].Srv.walletState.Refresh(tcs[1].MetaContext(), fakeAcct.accountID, "test")
 	require.NoError(t, err)
 
 	send := func(bid stellar1.BuildPaymentID, amount string) (errorString string) {
@@ -2642,6 +2838,7 @@ func TestSetMobileOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, stellar1.AccountMode_USER, details.AccountMode)
 	require.Equal(t, true, details.AccountModeEditable)
+	require.Equal(t, false, details.DeviceReadOnly)
 
 	err = tcs[0].Srv.SetAccountMobileOnlyLocal(context.Background(), stellar1.SetAccountMobileOnlyLocalArg{AccountID: accountID})
 	require.NoError(t, err)
@@ -2658,12 +2855,31 @@ func TestSetMobileOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, stellar1.AccountMode_MOBILE, details.AccountMode)
 	require.Equal(t, true, details.AccountModeEditable)
+	require.Equal(t, false, details.DeviceReadOnly)
 
 	mode, err := tcs[0].Srv.walletState.AccountMode(accountID)
 	require.NoError(t, err)
 	require.Equal(t, stellar1.AccountMode_MOBILE, mode)
 
 	// service_test verifies that `SetAccountMobileOnlyLocal` behaves correctly under the covers
+
+	// Provision new mobile to check AccountModeEditable and DeviceReadOnly
+	tc2, cleanup2 := provisionNewDeviceForTest(t, tcs[0], libkb.DeviceTypeMobile)
+	defer cleanup2()
+	details, err = tc2.Srv.GetWalletAccountLocal(context.Background(), walletAcctLocalArg)
+	require.NoError(t, err)
+	require.Equal(t, stellar1.AccountMode_MOBILE, details.AccountMode)
+	require.Equal(t, false, details.AccountModeEditable)
+	require.Equal(t, true, details.DeviceReadOnly)
+
+	// Provision new desktop device.
+	tc3, cleanup3 := provisionNewDeviceForTest(t, tcs[0], libkb.DeviceTypeDesktop)
+	defer cleanup3()
+	details, err = tc3.Srv.GetWalletAccountLocal(context.Background(), walletAcctLocalArg)
+	require.NoError(t, err)
+	require.Equal(t, stellar1.AccountMode_MOBILE, details.AccountMode)
+	require.Equal(t, false, details.AccountModeEditable)
+	require.Equal(t, true, details.DeviceReadOnly)
 }
 
 const lumenautAccID = stellar1.AccountID("GCCD6AJOYZCUAQLX32ZJF2MKFFAUJ53PVCFQI3RHWKL3V47QYE2BNAUT")
@@ -2762,6 +2978,13 @@ func TestManageTrustlines(t *testing.T) {
 	tcs, cleanup := setupNTests(t, 1)
 	defer cleanup()
 
+	otherAccountID, _ := randomStellarKeypair()
+	trustlines, err := tcs[0].Srv.GetTrustlinesLocal(context.Background(), stellar1.GetTrustlinesLocalArg{
+		AccountID: otherAccountID,
+	})
+	require.NoError(t, err)
+	require.Len(t, trustlines, 0)
+
 	acceptDisclaimer(tcs[0])
 	accounts := tcs[0].Backend.ImportAccountsForUser(tcs[0])
 
@@ -2805,6 +3028,17 @@ func TestManageTrustlines(t *testing.T) {
 	require.Equal(t, keys, balances2[0].Asset)
 	require.Equal(t, "0.0000000", balances2[0].Amount)
 	require.Equal(t, "922337203685.4775807", balances2[0].Limit) // max limit
+
+	// Check if shows up it GetTrustlinesForRecipientLocal
+	rtlines, err := tcs[0].Srv.GetTrustlinesForRecipientLocal(context.Background(), stellar1.GetTrustlinesForRecipientLocalArg{
+		Recipient: tcs[0].Fu.Username,
+	})
+	require.NoError(t, err)
+	require.Len(t, rtlines.Trustlines, 1)
+	require.Equal(t, keys, rtlines.Trustlines[0].Asset)
+	require.Equal(t, "0.0000000", rtlines.Trustlines[0].Amount)
+	require.Equal(t, "922337203685.4775807", rtlines.Trustlines[0].Limit) // max limit
+	require.Equal(t, rtlines.RecipientType, stellar1.ParticipantType_KEYBASE)
 
 	// Change limit.
 	err = tcs[0].Srv.ChangeTrustlineLimitLocal(context.Background(), stellar1.ChangeTrustlineLimitLocalArg{
@@ -2941,4 +3175,16 @@ func check(t testing.TB) {
 		// The test failed. Possibly in anothe goroutine. Look earlier in the logs for the real failure.
 		require.FailNow(t, "test already failed")
 	}
+}
+
+func TestGetStaticConfigLocal(t *testing.T) {
+	tcs, cleanup := setupNTests(t, 1)
+	defer cleanup()
+
+	staticConfig, err := tcs[0].Srv.GetStaticConfigLocal(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, staticConfig.PaymentNoteMaxLength, 500)
+	require.Equal(t, staticConfig.RequestNoteMaxLength, 240)
+	require.Equal(t, staticConfig.PublicMemoMaxLength, 28)
 }

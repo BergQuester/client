@@ -25,8 +25,14 @@ type Login struct {
 	clientType keybase1.ClientType
 
 	doUserSwitch bool
-	PaperKey     string
-	DeviceName   string
+
+	// Used for non-interactive provisioning
+	PaperKey   string
+	DeviceName string
+
+	// Used in tests for reproducible key generation
+	naclSigningKeyPair    libkb.NaclKeyPair
+	naclEncryptionKeyPair libkb.NaclKeyPair
 
 	resetPending bool
 }
@@ -89,6 +95,11 @@ func (e *Login) Run(m libkb.MetaContext) (err error) {
 		return libkb.NewBadUsernameErrorWithFullMessage("Logging in with e-mail address is not supported")
 	}
 
+	var currentUsername libkb.NormalizedUsername
+	if dev := m.ActiveDevice(); dev != nil {
+		currentUsername = m.ActiveDevice().Username(m)
+	}
+
 	// check to see if already logged in
 	var loggedInOK bool
 	loggedInOK, err = e.checkLoggedInAndNotRevoked(m)
@@ -100,6 +111,10 @@ func (e *Login) Run(m libkb.MetaContext) (err error) {
 		return nil
 	}
 	m.Debug("Login: not currently logged in")
+
+	if e.doUserSwitch && !currentUsername.IsNil() {
+		defer e.restoreSession(m, currentUsername, func() error { return err })
+	}
 
 	// First see if this device is already provisioned and it is possible to log in.
 	loggedInOK, err = e.loginProvisionedDevice(m, e.username)
@@ -125,7 +140,7 @@ func (e *Login) Run(m libkb.MetaContext) (err error) {
 	// clear out any existing session:
 	m.Debug("clearing any existing login session with Logout before loading user for login")
 	// If the doUserSwitch flag is specified, we don't want to kill the existing session
-	m.G().LogoutWithSecretKill(m, !e.doUserSwitch)
+	m.G().LogoutCurrentUserWithSecretKill(m, !e.doUserSwitch)
 
 	// Set up a provisional login context for the purposes of running provisioning.
 	// This is where we'll store temporary session tokens, etc, that are useful
@@ -156,6 +171,22 @@ func (e *Login) Run(m libkb.MetaContext) (err error) {
 	return nil
 }
 
+func (e *Login) restoreSession(m libkb.MetaContext, originalUsername libkb.NormalizedUsername, errfn func() error) {
+	err := errfn()
+	if err == nil {
+		return
+	}
+
+	loggedInOK, err := e.loginProvisionedDevice(m, originalUsername.String())
+	if err != nil {
+		m.Debug("Login#restoreSession-loginProvisionedDevice error: %s", err)
+		return
+	}
+	if loggedInOK {
+		m.Debug("Login#restoreSession-loginProvisionedDevice success")
+	}
+}
+
 func (e *Login) loginProvision(m libkb.MetaContext) (bool, error) {
 	m.Debug("loading login user for %q", e.username)
 	ueng := newLoginLoadUser(m.G(), e.username)
@@ -179,6 +210,9 @@ func (e *Login) loginProvision(m libkb.MetaContext) (bool, error) {
 
 		PaperKey:   e.PaperKey,
 		DeviceName: e.DeviceName,
+
+		naclSigningKeyPair:    e.naclSigningKeyPair,
+		naclEncryptionKeyPair: e.naclEncryptionKeyPair,
 	}
 	deng := newLoginProvision(m.G(), darg)
 	if err := RunEngine2(m, deng); err != nil {
@@ -249,7 +283,7 @@ func (e *Login) checkLoggedInAndNotRevoked(m libkb.MetaContext) (bool, error) {
 		return false, err
 	case libkb.KeyRevokedError, libkb.DeviceNotFoundError:
 		m.Debug("Login on revoked or reset device: %s", err.Error())
-		if err = m.G().Logout(m.Ctx()); err != nil {
+		if err = m.G().LogoutUsernameWithSecretKill(m, username, true); err != nil {
 			m.Debug("logout error: %s", err)
 		}
 		return false, err

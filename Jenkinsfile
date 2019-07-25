@@ -4,6 +4,38 @@ import groovy.json.JsonSlurperClassic
 
 helpers = fileLoader.fromGit('helpers', 'https://github.com/keybase/jenkins-helpers.git', 'master', null, 'linux')
 
+def withKbweb(closure) {
+  try {
+    retry(5) {
+      sh "docker-compose up -d mysql.local"
+    }
+    // Give MySQL a few seconds to start up.
+    sleep(10)
+    sh "docker-compose up -d kbweb.local"
+
+    closure()
+  } catch (ex) {
+    def kbwebName = helpers.containerName('docker-compose', 'kbweb')
+    println "kbweb is running in ${kbwebName}"
+
+    println "Dockers:"
+    sh "docker ps -a"
+    sh "docker-compose stop"
+    helpers.logContainer('docker-compose', 'mysql')
+    helpers.logContainer('docker-compose', 'gregor')
+    logKbwebServices(kbwebName)
+    throw ex
+  } finally {
+    sh "docker-compose down"
+  }
+}
+
+def logKbwebServices(container) {
+  sh "docker cp ${container}:/keybase/logs ./kbweb-logs"
+  sh "tar -C kbweb-logs -czvf kbweb-logs.tar.gz ."
+  archive("kbweb-logs.tar.gz")
+}
+
 helpers.rootLinuxNode(env, {
   helpers.slackOnError("client", env, currentBuild)
 }, {}) {
@@ -18,6 +50,18 @@ helpers.rootLinuxNode(env, {
     [$class: 'RebuildSettings',
       autoRebuild: true,
     ],
+    parameters([
+        string(
+            name: 'kbwebProjectName',
+            defaultValue: '',
+            description: 'The project name of the upstream kbweb build',
+        ),
+        string(
+            name: 'gregorProjectName',
+            defaultValue: '',
+            description: 'The project name of the upstream gregor build',
+        ),
+    ]),
   ])
 
   env.BASEDIR=pwd()
@@ -66,10 +110,40 @@ helpers.rootLinuxNode(env, {
             mysqlImage.pull()
           },
           pull_gregor: {
-            gregorImage.pull()
+            if (cause == "upstream" && kbwebProjectName != '') {
+                retry(3) {
+                    step([$class: 'CopyArtifact',
+                            projectName: "${kbwebProjectName}",
+                            filter: 'kbgregor.tar.gz',
+                            fingerprintArtifacts: true,
+                            selector: [$class: 'TriggeredBuildSelector',
+                                allowUpstreamDependencies: false,
+                                fallbackToLastSuccessful: false,
+                                upstreamFilterStrategy: 'UseGlobalSetting'],
+                            target: '.'])
+                    sh "gunzip -c kbgregor.tar.gz | docker load"
+                }
+            } else {
+                gregorImage.pull()
+            }
           },
           pull_kbweb: {
-            kbwebImage.pull()
+            if (cause == "upstream" && kbwebProjectName != '') {
+                retry(3) {
+                    step([$class: 'CopyArtifact',
+                            projectName: "${kbwebProjectName}",
+                            filter: 'kbweb.tar.gz',
+                            fingerprintArtifacts: true,
+                            selector: [$class: 'TriggeredBuildSelector',
+                                allowUpstreamDependencies: false,
+                                fallbackToLastSuccessful: false,
+                                upstreamFilterStrategy: 'UseGlobalSetting'],
+                            target: '.'])
+                    sh "gunzip -c kbweb.tar.gz | docker load"
+                }
+            } else {
+                kbwebImage.pull()
+            }
           },
           remove_dockers: {
             sh 'docker stop $(docker ps -q) || echo "nothing to stop"'
@@ -99,7 +173,7 @@ helpers.rootLinuxNode(env, {
     }
 
     stage("Test") {
-      helpers.withKbweb() {
+      withKbweb() {
         parallel (
           test_linux_deps: {
             if (hasGoChanges) {
@@ -222,10 +296,7 @@ helpers.rootLinuxNode(env, {
                       // other than Go tests on Windows,
                       // add a `hasGoChanges` check here.
                       dir("go/keybase") {
-                        bat "go build --tags=production"
-                      }
-                      dir("go/keybase") {
-                        bat "go build"
+                        bat "go build -ldflags \"-s -w\" --tags=production"
                       }
                       testGo("test_windows_go_", getPackagesToTest(dependencyFiles))
                     }
@@ -272,7 +343,7 @@ helpers.rootLinuxNode(env, {
                   test_macos_go: {
                     if (hasGoChanges) {
                       dir("go/keybase") {
-                        sh "go build --tags=production"
+                        sh "go build -ldflags \"-s -w\" --tags=production"
                       }
                       testGo("test_macos_go_", getPackagesToTest(dependencyFiles))
                     }
@@ -433,7 +504,7 @@ def testGo(prefix, packagesToTest) {
           timeout: '3m',
         ],
         'github.com/keybase/client/go/libkb': [
-          timeout: '1m',
+          timeout: '5m',
         ],
         'github.com/keybase/client/go/install': [
           timeout: '30s',

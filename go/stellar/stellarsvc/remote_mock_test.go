@@ -252,7 +252,7 @@ func (t *txlogger) Pending(ctx context.Context, tc *TestContext, accountID stell
 // Check whether the caller is in the implicit team.
 // By loading the team.
 func (t *txlogger) isCallerInImplicitTeam(tc *TestContext, teamID keybase1.TeamID) bool {
-	team, err := tc.G.GetTeamLoader().Load(context.Background(), keybase1.LoadTeamArg{
+	team, _, err := tc.G.GetTeamLoader().Load(context.Background(), keybase1.LoadTeamArg{
 		ID:      teamID,
 		StaleOK: true,
 	})
@@ -400,8 +400,9 @@ func (a *FakeAccount) AdjustAssetBalance(amount int64, asset stellar1.Asset) {
 	}
 
 	balance := stellar1.Balance{
-		Amount: stellarnet.StringFromStellarAmount(amount),
-		Asset:  asset,
+		Amount:       stellarnet.StringFromStellarAmount(amount),
+		Asset:        asset,
+		IsAuthorized: true,
 	}
 	a.otherBalances = append(a.otherBalances, balance)
 }
@@ -459,8 +460,8 @@ func (r *RemoteClientMock) NextAutoClaim(ctx context.Context) (*stellar1.AutoCla
 	return r.Backend.NextAutoClaim(ctx, r.Tc)
 }
 
-func (r *RemoteClientMock) RecentPayments(ctx context.Context, accountID stellar1.AccountID, cursor *stellar1.PageCursor, limit int, skipPending bool) (stellar1.PaymentsPage, error) {
-	return r.Backend.RecentPayments(ctx, r.Tc, accountID, cursor, limit, skipPending)
+func (r *RemoteClientMock) RecentPayments(ctx context.Context, arg remote.RecentPaymentsArg) (stellar1.PaymentsPage, error) {
+	return r.Backend.RecentPayments(ctx, r.Tc, arg.AccountID, arg.Cursor, arg.Limit, arg.SkipPending)
 }
 
 func (r *RemoteClientMock) PendingPayments(ctx context.Context, accountID stellar1.AccountID, limit int) ([]stellar1.PaymentSummary, error) {
@@ -564,6 +565,18 @@ func (r *RemoteClientMock) FindPaymentPath(_ libkb.MetaContext, _ stellar1.Payme
 
 func (r *RemoteClientMock) SubmitPathPayment(_ libkb.MetaContext, _ stellar1.PathPaymentPost) (stellar1.PaymentResult, error) {
 	return stellar1.PaymentResult{}, errors.New("not mocked")
+}
+
+func (r *RemoteClientMock) FuzzyAssetSearch(_ libkb.MetaContext, _ stellar1.FuzzyAssetSearchArg) ([]stellar1.Asset, error) {
+	return nil, errors.New("not mocked")
+}
+
+func (r *RemoteClientMock) ListPopularAssets(_ libkb.MetaContext, _ stellar1.ListPopularAssetsArg) (stellar1.AssetListResult, error) {
+	return stellar1.AssetListResult{}, errors.New("not mocked")
+}
+
+func (r *RemoteClientMock) PostAnyTransaction(_ libkb.MetaContext, _ string) error {
+	return errors.New("post any transaction is not mocked")
 }
 
 var _ remote.Remoter = (*RemoteClientMock)(nil)
@@ -1054,8 +1067,9 @@ func (r *BackendMock) addAccountRandom(funded bool) stellar1.AccountID {
 		accountID: stellar1.AccountID(full.Address()),
 		secretKey: stellar1.SecretKey(full.Seed()),
 		balance: stellar1.Balance{
-			Asset:  stellar1.Asset{Type: "native"},
-			Amount: amount,
+			Asset:        stellar1.Asset{Type: "native"},
+			Amount:       amount,
+			IsAuthorized: true,
 		},
 	}
 
@@ -1074,8 +1088,9 @@ func (r *BackendMock) addAccountByID(accountID stellar1.AccountID, funded bool) 
 		T:         r.T,
 		accountID: accountID,
 		balance: stellar1.Balance{
-			Asset:  stellar1.AssetNative(),
-			Amount: amount,
+			Asset:        stellar1.AssetNative(),
+			Amount:       amount,
+			IsAuthorized: true,
 		},
 	}
 	require.Nil(r.T, r.accounts[a.accountID], "attempt to re-add account %v", a.accountID)
@@ -1326,8 +1341,9 @@ func (r *BackendMock) ChangeTrustline(ctx context.Context, tc *TestContext, sign
 					Code:   c,
 					Issuer: i,
 				},
-				Limit:  limitStr,
-				Amount: stellarnet.StringFromStellarAmount(0),
+				Limit:        limitStr,
+				Amount:       stellarnet.StringFromStellarAmount(0),
+				IsAuthorized: true,
 			})
 			tc.T.Logf("BackendMock set limit added trustline %s with limit %s for account %s",
 				setOpt.Line.String(), limitStr, accountID)

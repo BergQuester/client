@@ -6,6 +6,7 @@ package libkbfs
 
 import (
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	stdpath "path"
@@ -63,24 +64,20 @@ const (
 type branchType int
 
 const (
-	standard       branchType = iota // an online, read-write branch
-	archive                          // an online, read-only branch
-	offline                          // an offline, read-write branch
-	archiveOffline                   // an offline, read-only branch
+	standard branchType = iota // an online, read-write branch
+	archive                    // an online, read-only branch
+	offline                    // an offline, read-write branch
+	conflict                   // a cleared, local conflict branch
 )
 
 // Constants used in this file.  TODO: Make these configurable?
 const (
 	// Maximum number of blocks that can be sent in parallel
 	maxParallelBlockPuts = 100
-	// Maximum number of blocks that can be fetched in parallel
-	maxParallelBlockGets = 10
 	// Max response size for a single DynamoDB query is 1MB.
 	maxMDsAtATime = 10
 	// Cap the number of times we retry after a recoverable error
 	maxRetriesOnRecoverableErrors = 10
-	// When the number of dirty bytes exceeds this level, force a sync.
-	dirtyBytesThreshold = maxParallelBlockPuts * data.MaxBlockSizeBytesDefault
 	// If it's been more than this long since our last update, check
 	// the current head before downloading all of the new revisions.
 	fastForwardTimeThresh = 15 * time.Minute
@@ -89,6 +86,8 @@ const (
 	fastForwardRevThresh = 50
 	// Period between mark-and-sweep attempts.
 	markAndSweepPeriod = 1 * time.Hour
+	// A hard-coded reason used to derive the log obfuscator secret.
+	obfuscatorDerivationString = "Keybase-Derived-KBFS-Log-Obfuscator-1"
 )
 
 // ErrStillStagedAfterCR indicates that conflict resolution failed to take
@@ -260,6 +259,7 @@ type folderBranchOps struct {
 	bType         branchType
 	observers     *observerList
 	serviceStatus *kbfsCurrentStatus
+	favs          *Favorites
 
 	// The leveled locks below, when locked concurrently by the same
 	// goroutine, should only be taken in the following order to avoid
@@ -388,6 +388,9 @@ type folderBranchOps struct {
 
 	convLock sync.Mutex
 	convID   chat1.ConversationID
+
+	obLock   sync.RWMutex
+	obSecret data.NodeObfuscatorSecret
 }
 
 var _ fbmHelper = (*folderBranchOps)(nil)
@@ -398,14 +401,14 @@ func newFolderBranchOps(
 	config Config, fb data.FolderBranch,
 	bType branchType,
 	quotaUsage *EventuallyConsistentQuotaUsage,
-	serviceStatus *kbfsCurrentStatus) *folderBranchOps {
+	serviceStatus *kbfsCurrentStatus, favs *Favorites) *folderBranchOps {
 	var nodeCache NodeCache
 	if config.Mode().NodeCacheEnabled() {
 		nodeCache = newNodeCacheStandard(fb)
 		for _, f := range config.RootNodeWrappers() {
 			nodeCache.AddRootWrapper(f)
 		}
-		if bType == archive {
+		if bType == archive || bType == conflict {
 			nodeCache.AddRootWrapper(readonlyWrapper)
 		}
 	}
@@ -452,6 +455,7 @@ func newFolderBranchOps(
 		bType:         bType,
 		observers:     observers,
 		serviceStatus: serviceStatus,
+		favs:          favs,
 		status: newFolderBranchStatusKeeper(
 			config, nodeCache, quotaUsage, fb.Tlf.Bytes()),
 		mdWriterLock: mdWriterLock,
@@ -500,6 +504,9 @@ func newFolderBranchOps(
 	fbo.rekeyFSM = NewRekeyFSM(fbo)
 	if config.DoBackgroundFlushes() && bType == standard {
 		fbo.goTracked(fbo.backgroundFlusher)
+	}
+	if config.Mode().NodeCacheEnabled() {
+		nodeCache.SetObfuscatorMaker(fbo.makeObfuscator)
 	}
 
 	return fbo
@@ -575,30 +582,29 @@ func (fbo *folderBranchOps) branch() data.BranchName {
 	return fbo.folderBranch.Branch
 }
 
-func (fbo *folderBranchOps) addToFavorites(ctx context.Context,
-	favorites *Favorites, created bool) (err error) {
+func (fbo *folderBranchOps) addToFavorites(
+	ctx context.Context, created bool) (err error) {
 	lState := makeFBOLockState()
 	head := fbo.getTrustedHead(ctx, lState, mdNoCommit)
 	if head == (ImmutableRootMetadata{}) {
 		return OpsCantHandleFavorite{"Can't add a favorite without a handle"}
 	}
 
-	return fbo.addToFavoritesByHandle(ctx, favorites, head.GetTlfHandle(), created)
+	return fbo.addToFavoritesByHandle(ctx, head.GetTlfHandle(), created)
 }
 
-func (fbo *folderBranchOps) addToFavoritesByHandle(ctx context.Context,
-	favorites *Favorites, handle *tlfhandle.Handle, created bool) (err error) {
+func (fbo *folderBranchOps) addToFavoritesByHandle(
+	ctx context.Context, handle *tlfhandle.Handle, created bool) (err error) {
 	if _, err := fbo.config.KBPKI().GetCurrentSession(ctx); err != nil {
 		// Can't favorite while not logged in
 		return nil
 	}
 
-	favorites.AddAsync(ctx, handle.ToFavToAdd(created))
+	fbo.favs.AddAsync(ctx, handle.ToFavToAdd(created))
 	return nil
 }
 
-func (fbo *folderBranchOps) deleteFromFavorites(ctx context.Context,
-	favorites *Favorites) error {
+func (fbo *folderBranchOps) deleteFromFavorites(ctx context.Context) error {
 	if _, err := fbo.config.KBPKI().GetCurrentSession(ctx); err != nil {
 		// Can't unfavorite while not logged in
 		return nil
@@ -612,26 +618,30 @@ func (fbo *folderBranchOps) deleteFromFavorites(ctx context.Context,
 	}
 
 	h := head.GetTlfHandle()
-	return favorites.Delete(ctx, h.ToFavorite())
+	return fbo.favs.Delete(ctx, h.ToFavorite())
 }
 
-func (fbo *folderBranchOps) doFavoritesOp(ctx context.Context,
-	favs *Favorites, fop FavoritesOp, handle *tlfhandle.Handle) error {
+func (fbo *folderBranchOps) doFavoritesOp(
+	ctx context.Context, fop FavoritesOp, handle *tlfhandle.Handle) error {
+	if fbo.bType == conflict {
+		// Ignore local conflicts, they should never be added as real favorites.
+		return nil
+	}
 	switch fop {
 	case FavoritesOpNoChange:
 		return nil
 	case FavoritesOpAdd:
 		if handle != nil {
-			return fbo.addToFavoritesByHandle(ctx, favs, handle, false)
+			return fbo.addToFavoritesByHandle(ctx, handle, false)
 		}
-		return fbo.addToFavorites(ctx, favs, false)
+		return fbo.addToFavorites(ctx, false)
 	case FavoritesOpAddNewlyCreated:
 		if handle != nil {
-			return fbo.addToFavoritesByHandle(ctx, favs, handle, true)
+			return fbo.addToFavoritesByHandle(ctx, handle, true)
 		}
-		return fbo.addToFavorites(ctx, favs, true)
+		return fbo.addToFavorites(ctx, true)
 	case FavoritesOpRemove:
-		return fbo.deleteFromFavorites(ctx, favs)
+		return fbo.deleteFromFavorites(ctx)
 	default:
 		return InvalidFavoritesOpError{}
 	}
@@ -740,7 +750,7 @@ func (fbo *folderBranchOps) clearConflictView(ctx context.Context) (
 
 	fbo.log.CDebugf(ctx, "Clearing conflict view")
 	defer func() {
-		fbo.log.CDebugf(ctx, "Done with clearConflictView: %+v", err)
+		fbo.deferLog.CDebugf(ctx, "Done with clearConflictView: %+v", err)
 	}()
 
 	lState := makeFBOLockState()
@@ -756,7 +766,124 @@ func (fbo *folderBranchOps) clearConflictView(ctx context.Context) (
 	if err != nil {
 		return err
 	}
-	return fbo.cr.clearConflictRecords()
+	return fbo.cr.clearConflictRecords(ctx)
+}
+
+// forceStuckConflictForTesting forces the TLF into a stuck conflict
+// view, for testing.
+func (fbo *folderBranchOps) forceStuckConflictForTesting(
+	ctx context.Context) (err error) {
+	startTime, timer := fbo.startOp(ctx, "Forcing a stuck conflict")
+	defer func() {
+		fbo.endOp(
+			ctx, startTime, timer, "Forcing a stuck conflict done: %+v", err)
+	}()
+
+	lState := makeFBOLockState()
+	fbo.mdWriterLock.Lock(lState)
+	defer fbo.mdWriterLock.Unlock(lState)
+
+	if fbo.isUnmergedLocked(lState) {
+		return errors.New("Cannot force conflict when already unmerged")
+	}
+
+	// Disable updates.
+	unpauseUpdatesCh := make(chan struct{})
+	fbo.updatePauseChan <- unpauseUpdatesCh
+	defer func() { unpauseUpdatesCh <- struct{}{} }()
+
+	// Make a no-op revision with an empty resolutionOp. Wait for it
+	// to flush to the server.
+	origHead, _ := fbo.getHead(ctx, lState, mdNoCommit)
+	mergedGCOp := newGCOp(origHead.data.LastGCRevision)
+	err = fbo.finalizeGCOpLocked(ctx, lState, mergedGCOp)
+	if err != nil {
+		return err
+	}
+
+	jManager, _ := GetJournalManager(fbo.config)
+	if jManager != nil {
+		err := fbo.waitForJournalLocked(ctx, lState, jManager)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Roll back the local view to the original revision.
+	err = func() error {
+		fbo.headLock.Lock(lState)
+		defer fbo.headLock.Unlock(lState)
+		err = fbo.setHeadLocked(ctx, lState, origHead, headTrusted, mdNoCommit)
+		if err != nil {
+			return err
+		}
+		fbo.setLatestMergedRevisionLocked(
+			ctx, lState, origHead.Revision(), true)
+		return nil
+	}()
+	if err != nil {
+		return err
+	}
+
+	// Set CR to always fail.
+	oldMode := fbo.cr.getFailModeForTesting()
+	fbo.cr.setFailModeForTesting(alwaysFailCR)
+	defer func() { fbo.cr.setFailModeForTesting(oldMode) }()
+
+	// Make fake conflicting files to trigger CR. Make one for each
+	// attempt needed to result in stuck CR.
+	handle := origHead.GetTlfHandle()
+	rootNode, err := fbo.nodeCache.GetOrCreate(
+		origHead.data.Dir.BlockPointer,
+		data.NewPathPartString(string(handle.GetCanonicalName()),
+			fbo.makeObfuscator()),
+		nil, data.Dir)
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < maxConflictResolutionAttempts+1; i++ {
+		filename := fmt.Sprintf("FILE_FOR_STUCK_CONFLICT_%02d", i)
+		_, _, err := fbo.createEntryLocked(
+			ctx, lState, rootNode, rootNode.ChildName(filename), data.File,
+			NoExcl)
+		if err != nil {
+			return err
+		}
+
+		err = fbo.syncAllLocked(ctx, lState, NoExcl)
+		if err != nil {
+			return err
+		}
+
+		if jManager != nil && TLFJournalEnabled(fbo.config, fbo.id()) {
+			// Can't use fbo.waitForJournalLocked here, since the
+			// flushing won't actually complete.
+			err := jManager.Wait(ctx, fbo.id())
+			if err != nil {
+				return err
+			}
+			newHead, _ := fbo.getHead(ctx, lState, mdNoCommit)
+			fbo.cr.Resolve(
+				ctx, newHead.Revision(), kbfsmd.RevisionUninitialized)
+		}
+
+		err = fbo.cr.Wait(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Make sure we're stuck.
+	isStuck, err := fbo.cr.isStuck()
+	if err != nil {
+		return err
+	}
+	if !isStuck {
+		return errors.New("CR not stuck after trying to force conflict")
+	}
+
+	return nil
 }
 
 func (fbo *folderBranchOps) setBranchIDLocked(
@@ -777,17 +904,12 @@ var errNoFlushedRevisions = errors.New("No flushed MDs yet")
 var errNoMergedRevWhileStaged = errors.New(
 	"Cannot find most recent merged revision while staged")
 
-// getJournalPredecessorRevision returns the revision that precedes
-// the current journal head if journaling enabled and there are
-// unflushed MD updates; otherwise it returns
-// kbfsmd.RevisionUninitialized.  If there aren't any flushed MD
-// revisions, it returns errNoFlushedRevisions.
-func (fbo *folderBranchOps) getJournalPredecessorRevision(ctx context.Context) (
-	kbfsmd.Revision, error) {
+func (fbo *folderBranchOps) getJournalRevisions(ctx context.Context) (
+	predRev, journalEndRev kbfsmd.Revision, err error) {
 	jManager, err := GetJournalManager(fbo.config)
 	if err != nil {
 		// Journaling is disabled entirely.
-		return kbfsmd.RevisionUninitialized, nil
+		return kbfsmd.RevisionUninitialized, kbfsmd.RevisionUninitialized, nil
 	}
 
 	jStatus, err := jManager.JournalStatus(fbo.id())
@@ -797,23 +919,36 @@ func (fbo *folderBranchOps) getJournalPredecessorRevision(ctx context.Context) (
 		// file/disk corruption) that indicate a real problem, so it
 		// might be nice to type those errors so we can distinguish
 		// them.
-		return kbfsmd.RevisionUninitialized, nil
+		return kbfsmd.RevisionUninitialized, kbfsmd.RevisionUninitialized, nil
 	}
 
 	if jStatus.BranchID != kbfsmd.NullBranchID.String() {
-		return kbfsmd.RevisionUninitialized, errNoMergedRevWhileStaged
+		return kbfsmd.RevisionUninitialized, kbfsmd.RevisionUninitialized,
+			errNoMergedRevWhileStaged
 	}
 
 	if jStatus.RevisionStart == kbfsmd.RevisionUninitialized {
 		// The journal is empty, so the local head must be the most recent.
-		return kbfsmd.RevisionUninitialized, nil
+		return kbfsmd.RevisionUninitialized, kbfsmd.RevisionUninitialized, nil
 	} else if jStatus.RevisionStart == kbfsmd.RevisionInitial {
 		// Nothing has been flushed to the servers yet, so don't
 		// return anything.
-		return kbfsmd.RevisionUninitialized, errNoFlushedRevisions
+		return kbfsmd.RevisionUninitialized, kbfsmd.RevisionUninitialized,
+			errNoFlushedRevisions
 	}
 
-	return jStatus.RevisionStart - 1, nil
+	return jStatus.RevisionStart - 1, jStatus.RevisionEnd, nil
+}
+
+// getJournalPredecessorRevision returns the revision that precedes
+// the current journal head if journaling enabled and there are
+// unflushed MD updates; otherwise it returns
+// kbfsmd.RevisionUninitialized.  If there aren't any flushed MD
+// revisions, it returns errNoFlushedRevisions.
+func (fbo *folderBranchOps) getJournalPredecessorRevision(ctx context.Context) (
+	kbfsmd.Revision, error) {
+	pred, _, err := fbo.getJournalRevisions(ctx)
+	return pred, err
 }
 
 // validateHeadLocked validates an untrusted head and sets it as trusted.
@@ -1029,7 +1164,8 @@ pathLoop:
 			}
 			// TODO: parallelize the parent fetches and lookups.
 			currNode, _, err = fbo.blocks.Lookup(
-				ctx, lState, latestMerged.ReadOnly(), currNode, parent)
+				ctx, lState, latestMerged.ReadOnly(), currNode,
+				currNode.ChildName(parent))
 			switch errors.Cause(err).(type) {
 			case idutil.NoSuchNameError:
 				fbo.vlog.CLogf(
@@ -1052,7 +1188,8 @@ pathLoop:
 
 		// Kick off a full deep sync of `syncedElem`.
 		elemNode, _, err := fbo.blocks.Lookup(
-			ctx, lState, latestMerged.ReadOnly(), currNode, syncedElem)
+			ctx, lState, latestMerged.ReadOnly(), currNode,
+			currNode.ChildName(syncedElem))
 		switch errors.Cause(err).(type) {
 		case idutil.NoSuchNameError:
 			fbo.vlog.CLogf(
@@ -1191,7 +1328,8 @@ func (fbo *folderBranchOps) kickOffPartialSyncIfNeeded(
 		// If we're not syncing the TLF at all, start a partial "sync"
 		// using the recently-edited files list, storing the blocks in
 		// the working set cache.
-		if !fbo.config.Mode().TLFEditHistoryEnabled() {
+		if !fbo.config.Mode().TLFEditHistoryEnabled() ||
+			fbo.config.Mode().DefaultBlockRequestAction() == BlockRequestSolo {
 			return
 		}
 		err := fbo.editActivity.Wait(ctx)
@@ -1304,7 +1442,8 @@ pathLoop:
 				continue
 			}
 			// TODO: parallelize the parent fetches and lookups.
-			currNode, _, err = fbo.Lookup(ctx, currNode, parent)
+			currNode, _, err = fbo.Lookup(
+				ctx, currNode, currNode.ChildName(parent))
 			switch errors.Cause(err).(type) {
 			case idutil.NoSuchNameError:
 				fbo.vlog.CLogf(
@@ -1323,7 +1462,8 @@ pathLoop:
 		}
 
 		// Now mark everything rooted at this path.
-		currNode, _, err = fbo.Lookup(ctx, currNode, syncedElem)
+		currNode, _, err = fbo.Lookup(
+			ctx, currNode, currNode.ChildName(syncedElem))
 		switch errors.Cause(err).(type) {
 		case idutil.NoSuchNameError:
 			fbo.vlog.CLogf(
@@ -1652,6 +1792,34 @@ func (fbo *folderBranchOps) commitFlushedMD(
 	}
 }
 
+func (fbo *folderBranchOps) setObfuscatorSecret(
+	ctx context.Context, kmd libkey.KeyMetadata) error {
+	if !fbo.config.Mode().DoLogObfuscation() {
+		return nil
+	}
+
+	fbo.obLock.Lock()
+	defer fbo.obLock.Unlock()
+
+	if fbo.obSecret != nil {
+		panic("Obfuscator secret is being set more than once")
+	}
+
+	fbo.log.CDebugf(ctx, "Making the log obfuscator secret")
+	secret, err := getMDObfuscationSecret(ctx, fbo.config.KeyManager(), kmd)
+	if err != nil {
+		return err
+	}
+	fbo.obSecret = secret
+	return nil
+}
+
+func (fbo *folderBranchOps) makeObfuscator() data.Obfuscator {
+	fbo.obLock.RLock()
+	defer fbo.obLock.RUnlock()
+	return makeMDObfuscatorFromSecret(fbo.obSecret, fbo.config.Mode())
+}
+
 func (fbo *folderBranchOps) setHeadLocked(
 	ctx context.Context, lState *kbfssync.LockState,
 	md ImmutableRootMetadata, headStatus headTrustStatus,
@@ -1661,7 +1829,12 @@ func (fbo *folderBranchOps) setHeadLocked(
 
 	isFirstHead := fbo.head == ImmutableRootMetadata{}
 	wasReadable := false
-	if !isFirstHead {
+	if isFirstHead {
+		err := fbo.setObfuscatorSecret(ctx, md.ReadOnly())
+		if err != nil {
+			return err
+		}
+	} else {
 		if headStatus == headUntrusted {
 			panic("setHeadLocked: Trying to set an untrusted head over an existing head")
 		}
@@ -2085,10 +2258,12 @@ func (fbo *folderBranchOps) getMDForWriteOrRekeyLocked(
 	// if this device has any unmerged commits -- take the latest one.
 	mdops := fbo.config.MDOps()
 
-	// get the head of the unmerged branch for this device (if any)
-	md, err = mdops.GetUnmergedForTLF(ctx, fbo.id(), kbfsmd.NullBranchID)
-	if err != nil {
-		return ImmutableRootMetadata{}, err
+	if fbo.config.Mode().UnmergedTLFsEnabled() {
+		// get the head of the unmerged branch for this device (if any)
+		md, err = mdops.GetUnmergedForTLF(ctx, fbo.id(), kbfsmd.NullBranchID)
+		if err != nil {
+			return ImmutableRootMetadata{}, err
+		}
 	}
 
 	mergedMD, err := mdops.GetForTLF(ctx, fbo.id(), nil)
@@ -2569,18 +2744,12 @@ func (fbo *folderBranchOps) initMDLocked(
 		mdOps = jManager.delegateMDOps
 	}
 	irmd, err := mdOps.Put(
-		ctx, md, session.VerifyingKey, nil, keybase1.MDPriorityNormal)
+		ctx, md, session.VerifyingKey, nil, keybase1.MDPriorityNormal, bps)
 	isConflict := isRevisionConflict(err)
 	if err != nil && !isConflict {
 		return err
 	} else if isConflict {
 		return RekeyConflictError{err}
-	}
-
-	md, irmd, err = fbo.loadCachedMDChanges(ctx, bps,
-		session.VerifyingKey, md, irmd)
-	if err != nil {
-		return err
 	}
 
 	fbo.headLock.Lock(lState)
@@ -2741,7 +2910,7 @@ func (fbo *folderBranchOps) SetInitialHeadFromServer(
 		fbo.mdWriterLock.Lock(lState)
 		defer fbo.mdWriterLock.Unlock(lState)
 
-		if md.MergedStatus() == kbfsmd.Unmerged {
+		if md.MergedStatus() == kbfsmd.Unmerged && fbo.bType != conflict {
 			mdops := fbo.config.MDOps()
 			mergedMD, err := mdops.GetForTLF(ctx, fbo.id(), nil)
 			if err != nil {
@@ -2871,7 +3040,8 @@ func (fbo *folderBranchOps) getRootNode(ctx context.Context) (
 
 	handle = md.GetTlfHandle()
 	node, err = fbo.nodeCache.GetOrCreate(md.data.Dir.BlockPointer,
-		string(handle.GetCanonicalName()), nil, data.Dir)
+		data.NewPathPartString(string(handle.GetCanonicalName()), nil),
+		nil, data.Dir)
 	if err != nil {
 		return nil, data.EntryInfo{}, nil, err
 	}
@@ -2905,7 +3075,7 @@ func (fbo *folderBranchOps) pathFromNodeForMDWriteLocked(
 }
 
 func (fbo *folderBranchOps) getDirChildren(ctx context.Context, dir Node) (
-	children map[string]data.EntryInfo, err error) {
+	children map[data.PathPartString]data.EntryInfo, err error) {
 	fs := dir.GetFS(ctx)
 	if fs != nil {
 		fbo.vlog.CLogf(ctx, libkb.VLog1, "Getting children using an FS")
@@ -2913,7 +3083,7 @@ func (fbo *folderBranchOps) getDirChildren(ctx context.Context, dir Node) (
 		if err != nil {
 			return nil, err
 		}
-		children = make(map[string]data.EntryInfo, len(fis))
+		children = make(map[data.PathPartString]data.EntryInfo, len(fis))
 		for _, fi := range fis {
 			name := fi.Name()
 			ei := data.EntryInfoFromFileInfo(fi)
@@ -2924,7 +3094,7 @@ func (fbo *folderBranchOps) getDirChildren(ctx context.Context, dir Node) (
 				}
 				ei.SymPath = target
 			}
-			children[name] = ei
+			children[dir.ChildName(name)] = ei
 		}
 		return children, nil
 	}
@@ -2990,7 +3160,7 @@ func (fbo *folderBranchOps) transformReadError(
 }
 
 func (fbo *folderBranchOps) GetDirChildren(ctx context.Context, dir Node) (
-	children map[string]data.EntryInfo, err error) {
+	children map[data.PathPartString]data.EntryInfo, err error) {
 	startTime, timer := fbo.startOp(ctx, "GetDirChildren %s", getNodeIDStr(dir))
 	defer func() {
 		err = fbo.transformReadError(ctx, dir, err)
@@ -3004,7 +3174,7 @@ func (fbo *folderBranchOps) GetDirChildren(ctx context.Context, dir Node) (
 		return nil, err
 	}
 
-	var retChildren map[string]data.EntryInfo
+	var retChildren map[data.PathPartString]data.EntryInfo
 	err = runUnlessCanceled(ctx, func() error {
 		retChildren, err = fbo.getDirChildren(ctx, dir)
 		return err
@@ -3035,18 +3205,18 @@ func (fbo *folderBranchOps) GetDirChildren(ctx context.Context, dir Node) (
 }
 
 func (fbo *folderBranchOps) makeFakeEntryID(
-	ctx context.Context, dir Node, name string) (
+	ctx context.Context, dir Node, name data.PathPartString) (
 	id kbfsblock.ID, err error) {
 	// Use the path of the node to generate the node ID, which will be
 	// unique and deterministic within `fbo.nodeCache`.
 	dirPath := fbo.nodeCache.PathFromNode(dir)
 	return kbfsblock.MakePermanentID(
-		[]byte(dirPath.ChildPathNoPtr(name).String()),
+		[]byte(dirPath.ChildPathNoPtr(name, fbo.makeObfuscator()).String()),
 		fbo.config.BlockCryptVersion())
 }
 
 func (fbo *folderBranchOps) makeFakeDirEntry(
-	ctx context.Context, dir Node, name string) (
+	ctx context.Context, dir Node, name data.PathPartString) (
 	de data.DirEntry, err error) {
 	fbo.vlog.CLogf(ctx, libkb.VLog1, "Faking directory entry for %s", name)
 	id, err := fbo.makeFakeEntryID(ctx, dir, name)
@@ -3073,8 +3243,8 @@ func (fbo *folderBranchOps) makeFakeDirEntry(
 }
 
 func (fbo *folderBranchOps) makeFakeFileEntry(
-	ctx context.Context, dir Node, name string, fi os.FileInfo,
-	sympath string) (de data.DirEntry, err error) {
+	ctx context.Context, dir Node, name data.PathPartString, fi os.FileInfo,
+	sympath data.PathPartString) (de data.DirEntry, err error) {
 	fbo.vlog.CLogf(ctx, libkb.VLog1, "Faking file entry for %s", name)
 	id, err := fbo.makeFakeEntryID(ctx, dir, name)
 	if err != nil {
@@ -3091,14 +3261,15 @@ func (fbo *folderBranchOps) makeFakeFileEntry(
 		EntryInfo: data.EntryInfoFromFileInfo(fi),
 	}
 	if de.Type == data.Sym {
-		de.SymPath = sympath
+		de.SymPath = sympath.Plaintext()
 	}
 	return de, nil
 }
 
 func (fbo *folderBranchOps) processMissedLookup(
-	ctx context.Context, lState *kbfssync.LockState, dir Node, name string,
-	missErr error) (node Node, ei data.EntryInfo, err error) {
+	ctx context.Context, lState *kbfssync.LockState, dir Node,
+	name data.PathPartString, missErr error) (
+	node Node, ei data.EntryInfo, err error) {
 	// Check if the directory node wants to autocreate this.
 	autocreate, ctx, et, fi, sympath := dir.ShouldCreateMissedLookup(ctx, name)
 	if !autocreate {
@@ -3127,7 +3298,8 @@ func (fbo *folderBranchOps) processMissedLookup(
 		return node, de.EntryInfo, nil
 	}
 
-	if (sympath != "" && et != data.Sym) || (sympath == "" && et == data.Sym) {
+	if (sympath.Plaintext() != "" && et != data.Sym) ||
+		(sympath.Plaintext() == "" && et == data.Sym) {
 		return nil, data.EntryInfo{}, errors.Errorf(
 			"Invalid sympath %s for entry type %s", sympath, et)
 	}
@@ -3151,8 +3323,8 @@ func (fbo *folderBranchOps) processMissedLookup(
 }
 
 func (fbo *folderBranchOps) statUsingFS(
-	ctx context.Context, lState *kbfssync.LockState, node Node, name string) (
-	de data.DirEntry, ok bool, err error) {
+	ctx context.Context, lState *kbfssync.LockState, node Node,
+	name data.PathPartString) (de data.DirEntry, ok bool, err error) {
 	if node == nil {
 		return data.DirEntry{}, false, nil
 	}
@@ -3182,16 +3354,17 @@ func (fbo *folderBranchOps) statUsingFS(
 
 	fbo.vlog.CLogf(ctx, libkb.VLog1, "Using an FS to satisfy stat of %s", name)
 
-	fi, err = fs.Lstat(name)
+	fi, err = fs.Lstat(name.Plaintext())
 	if err != nil {
 		return data.DirEntry{}, false, err
 	}
 
 	if fi.Mode()&os.ModeSymlink != 0 {
-		sympath, err = fs.Readlink(name)
+		sympathPlain, err := fs.Readlink(name.Plaintext())
 		if err != nil {
 			return data.DirEntry{}, false, err
 		}
+		sympath = node.ChildName(sympathPlain)
 	}
 
 	de, err = fbo.makeFakeFileEntry(ctx, node, name, fi, sympath)
@@ -3201,7 +3374,8 @@ func (fbo *folderBranchOps) statUsingFS(
 	return de, true, nil
 }
 
-func (fbo *folderBranchOps) lookup(ctx context.Context, dir Node, name string) (
+func (fbo *folderBranchOps) lookup(
+	ctx context.Context, dir Node, name data.PathPartString) (
 	node Node, de data.DirEntry, err error) {
 	lState := makeFBOLockState()
 
@@ -3221,7 +3395,7 @@ func (fbo *folderBranchOps) lookup(ctx context.Context, dir Node, name string) (
 		fbo.vlog.CLogf(
 			ctx, libkb.VLog1, "Refusing a lookup for unlinked directory %v",
 			fbo.nodeCache.PathFromNode(dir).TailPointer())
-		return nil, data.DirEntry{}, idutil.NoSuchNameError{Name: name}
+		return nil, data.DirEntry{}, idutil.NoSuchNameError{Name: name.String()}
 	}
 
 	md, err := fbo.getMDForReadNeedIdentify(ctx, lState)
@@ -3243,7 +3417,8 @@ func (fbo *folderBranchOps) lookup(ctx context.Context, dir Node, name string) (
 	return node, de, err
 }
 
-func (fbo *folderBranchOps) Lookup(ctx context.Context, dir Node, name string) (
+func (fbo *folderBranchOps) Lookup(
+	ctx context.Context, dir Node, name data.PathPartString) (
 	node Node, ei data.EntryInfo, err error) {
 	startTime, timer := fbo.startOp(
 		ctx, "Lookup %s %s", getNodeIDStr(dir), name)
@@ -3452,13 +3627,13 @@ func (fbo *folderBranchOps) finalizeBlocks(
 		return nil
 	}
 	bcache := fbo.config.BlockCache()
-	for _, newPtr := range bps.ptrs() {
+	for _, newPtr := range bps.Ptrs() {
 		// only cache this block if we made a brand new block, not if
 		// we just incref'd some other block.
 		if !newPtr.IsFirstRef() {
 			continue
 		}
-		block, err := bps.getBlock(ctx, newPtr)
+		block, err := bps.GetBlock(ctx, newPtr)
 		if err != nil {
 			fbo.log.CDebugf(ctx, "Error getting block for %v: %+v", newPtr, err)
 		}
@@ -3631,25 +3806,6 @@ func (fbo *folderBranchOps) handleUnflushedEditNotifications(
 	return nil
 }
 
-func (fbo *folderBranchOps) loadCachedMDChanges(ctx context.Context,
-	bps blockPutState, key kbfscrypto.VerifyingKey, md *RootMetadata,
-	irmd ImmutableRootMetadata) (*RootMetadata, ImmutableRootMetadata, error) {
-	md, copied := md.loadCachedBlockChanges(
-		ctx, bps, fbo.log, fbo.vlog, fbo.config.Codec())
-
-	if copied {
-		irmd = MakeImmutableRootMetadata(
-			md, key, irmd.mdID, fbo.config.Clock().Now(), true)
-
-		err := fbo.config.MDCache().Replace(irmd, irmd.BID())
-		if err != nil {
-			return nil, ImmutableRootMetadata{}, err
-		}
-	}
-	return md, irmd, nil
-
-}
-
 func (fbo *folderBranchOps) finalizeMDWriteLocked(ctx context.Context,
 	lState *kbfssync.LockState, md *RootMetadata, bps blockPutState, excl Excl,
 	notifyFn func(ImmutableRootMetadata) error) (
@@ -3711,7 +3867,7 @@ func (fbo *folderBranchOps) finalizeMDWriteLocked(ctx context.Context,
 	if isMerged {
 		// only do a normal Put if we're not already staged.
 		irmd, err = mdops.Put(
-			ctx, md, session.VerifyingKey, nil, keybase1.MDPriorityNormal)
+			ctx, md, session.VerifyingKey, nil, keybase1.MDPriorityNormal, bps)
 		if doUnmergedPut = isRevisionConflict(err); doUnmergedPut {
 			fbo.log.CDebugf(ctx, "Conflict: %v", err)
 			mergedRev = md.Revision()
@@ -3739,7 +3895,7 @@ func (fbo *folderBranchOps) finalizeMDWriteLocked(ctx context.Context,
 	if doUnmergedPut {
 		// We're out of date, and this is not an exclusive write, so put it as an
 		// unmerged MD.
-		irmd, err = mdops.PutUnmerged(ctx, md, session.VerifyingKey)
+		irmd, err = mdops.PutUnmerged(ctx, md, session.VerifyingKey, bps)
 		if isRevisionConflict(err) {
 			// Self-conflicts are retried in `doMDWriteWithRetry`.
 			return UnmergedSelfConflictError{err}
@@ -3796,12 +3952,6 @@ func (fbo *folderBranchOps) finalizeMDWriteLocked(ctx context.Context,
 			// theoretically possible.
 			defer fbo.config.RekeyQueue().Enqueue(md.TlfID())
 		}
-	}
-
-	md, irmd, err = fbo.loadCachedMDChanges(ctx, bps,
-		session.VerifyingKey, md, irmd)
-	if err != nil {
-		return err
 	}
 
 	rebased := (oldPrevRoot != md.PrevRoot())
@@ -3928,7 +4078,7 @@ func (fbo *folderBranchOps) finalizeMDRekeyWriteLocked(ctx context.Context,
 		key = session.VerifyingKey
 	}
 
-	irmd, err := mdOps.Put(ctx, md, key, nil, keybase1.MDPriorityNormal)
+	irmd, err := mdOps.Put(ctx, md, key, nil, keybase1.MDPriorityNormal, nil)
 	isConflict := isRevisionConflict(err)
 	if err != nil && !isConflict {
 		return err
@@ -3953,11 +4103,6 @@ func (fbo *folderBranchOps) finalizeMDRekeyWriteLocked(ctx context.Context,
 		fbo.cr.Resolve(ctx, md.Revision(), kbfsmd.RevisionUninitialized)
 	}
 
-	md, irmd, err = fbo.loadCachedMDChanges(ctx, nil, key, md, irmd)
-	if err != nil {
-		return err
-	}
-
 	fbo.headLock.Lock(lState)
 	defer fbo.headLock.Unlock(lState)
 	err = fbo.setHeadSuccessorLocked(ctx, lState, irmd, rebased)
@@ -3972,13 +4117,9 @@ func (fbo *folderBranchOps) finalizeMDRekeyWriteLocked(ctx context.Context,
 	return nil
 }
 
-func (fbo *folderBranchOps) finalizeGCOp(ctx context.Context, gco *GCOp) (
-	err error) {
-	lState := makeFBOLockState()
-	// Lock the folder so we can get an internally-consistent MD
-	// revision number.
-	fbo.mdWriterLock.Lock(lState)
-	defer fbo.mdWriterLock.Unlock(lState)
+func (fbo *folderBranchOps) finalizeGCOpLocked(
+	ctx context.Context, lState *kbfssync.LockState, gco *GCOp) (err error) {
+	fbo.mdWriterLock.AssertLocked(lState)
 
 	md, err := fbo.getSuccessorMDForWriteLocked(ctx, lState)
 	if err != nil {
@@ -4013,7 +4154,7 @@ func (fbo *folderBranchOps) finalizeGCOp(ctx context.Context, gco *GCOp) (
 
 	// finally, write out the new metadata
 	irmd, err := fbo.config.MDOps().Put(
-		ctx, md, session.VerifyingKey, nil, keybase1.MDPriorityNormal)
+		ctx, md, session.VerifyingKey, nil, keybase1.MDPriorityNormal, bps)
 	if err != nil {
 		// Don't allow garbage collection to put us into a conflicting
 		// state; just wait for the next period.
@@ -4021,12 +4162,6 @@ func (fbo *folderBranchOps) finalizeGCOp(ctx context.Context, gco *GCOp) (
 	}
 
 	fbo.setBranchIDLocked(lState, kbfsmd.NullBranchID)
-
-	md, irmd, err = fbo.loadCachedMDChanges(ctx, bps,
-		session.VerifyingKey, md, irmd)
-	if err != nil {
-		return err
-	}
 
 	rebased := (oldPrevRoot != md.PrevRoot())
 	if rebased {
@@ -4045,6 +4180,16 @@ func (fbo *folderBranchOps) finalizeGCOp(ctx context.Context, gco *GCOp) (
 	return fbo.notifyBatchLocked(ctx, lState, irmd)
 }
 
+func (fbo *folderBranchOps) finalizeGCOp(ctx context.Context, gco *GCOp) (
+	err error) {
+	lState := makeFBOLockState()
+	// Lock the folder so we can get an internally-consistent MD
+	// revision number.
+	fbo.mdWriterLock.Lock(lState)
+	defer fbo.mdWriterLock.Unlock(lState)
+	return fbo.finalizeGCOpLocked(ctx, lState, gco)
+}
+
 // CtxAllowNameKeyType is the type for a context allowable name override key.
 type CtxAllowNameKeyType int
 
@@ -4056,13 +4201,14 @@ const (
 	CtxAllowNameKey CtxAllowNameKeyType = iota
 )
 
-func checkDisallowedPrefixes(ctx context.Context, name string) error {
+func checkDisallowedPrefixes(
+	ctx context.Context, name data.PathPartString) error {
 	for _, prefix := range disallowedPrefixes {
-		if strings.HasPrefix(name, prefix) {
+		if strings.HasPrefix(name.Plaintext(), prefix) {
 			if allowedName := ctx.Value(CtxAllowNameKey); allowedName != nil {
 				// Allow specialized KBFS programs (like the kbgit remote
 				// helper) to bypass the disallowed prefix check.
-				if name == allowedName.(string) {
+				if name.Plaintext() == allowedName.(string) {
 					return nil
 				}
 			}
@@ -4087,13 +4233,14 @@ func (fbo *folderBranchOps) PathType() tlfhandle.PathType {
 }
 
 // canonicalPath returns full canonical path for dir node and name.
-func (fbo *folderBranchOps) canonicalPath(ctx context.Context, dir Node, name string) (string, error) {
+func (fbo *folderBranchOps) canonicalPathPlaintext(
+	ctx context.Context, dir Node, name data.PathPartString) (string, error) {
 	dirPath, err := fbo.pathFromNodeForRead(dir)
 	if err != nil {
 		return "", err
 	}
 	return tlfhandle.BuildCanonicalPath(
-		fbo.PathType(), dirPath.String(), name), nil
+		fbo.PathType(), dirPath.Plaintext(), name.Plaintext()), nil
 }
 
 func (fbo *folderBranchOps) signalWrite() {
@@ -4131,24 +4278,26 @@ func (fbo *folderBranchOps) checkForUnlinkedDir(dir Node) error {
 
 // entryType must not by Sym.
 func (fbo *folderBranchOps) createEntryLocked(
-	ctx context.Context, lState *kbfssync.LockState, dir Node, name string,
-	entryType data.EntryType, excl Excl) (childNode Node, de data.DirEntry, err error) {
+	ctx context.Context, lState *kbfssync.LockState, dir Node,
+	name data.PathPartString, entryType data.EntryType, excl Excl) (
+	childNode Node, de data.DirEntry, err error) {
 	fbo.mdWriterLock.AssertLocked(lState)
 
 	if err := checkDisallowedPrefixes(ctx, name); err != nil {
 		return nil, data.DirEntry{}, err
 	}
 
-	if uint32(len(name)) > fbo.config.MaxNameBytes() {
+	if uint32(len(name.Plaintext())) > fbo.config.MaxNameBytes() {
 		return nil, data.DirEntry{},
-			NameTooLongError{name, fbo.config.MaxNameBytes()}
+			NameTooLongError{name.String(), fbo.config.MaxNameBytes()}
 	}
 
 	if err := fbo.checkForUnlinkedDir(dir); err != nil {
 		return nil, data.DirEntry{}, err
 	}
 
-	filename, err := fbo.canonicalPath(ctx, dir, name)
+	// Plaintext for notifications to the service.
+	filename, err := fbo.canonicalPathPlaintext(ctx, dir, name)
 	if err != nil {
 		return nil, data.DirEntry{}, err
 	}
@@ -4166,15 +4315,16 @@ func (fbo *folderBranchOps) createEntryLocked(
 
 	// does name already exist?
 	_, err = fbo.blocks.GetEntry(
-		ctx, lState, md.ReadOnly(), dirPath.ChildPathNoPtr(name))
+		ctx, lState, md.ReadOnly(), dirPath.ChildPathNoPtr(
+			name, fbo.makeObfuscator()))
 	if err == nil {
-		return nil, data.DirEntry{}, data.NameExistsError{Name: name}
+		return nil, data.DirEntry{}, data.NameExistsError{Name: name.String()}
 	} else if _, notExists := errors.Cause(err).(idutil.NoSuchNameError); !notExists {
 		return nil, data.DirEntry{}, err
 	}
 
 	parentPtr := dirPath.TailPointer()
-	co, err := newCreateOp(name, parentPtr, entryType)
+	co, err := newCreateOp(name.Plaintext(), parentPtr, entryType)
 	if err != nil {
 		return nil, data.DirEntry{}, err
 	}
@@ -4449,7 +4599,7 @@ func (fbo *folderBranchOps) doMDWriteWithRetryUnlessCanceled(
 }
 
 func (fbo *folderBranchOps) CreateDir(
-	ctx context.Context, dir Node, path string) (
+	ctx context.Context, dir Node, path data.PathPartString) (
 	n Node, ei data.EntryInfo, err error) {
 	startTime, timer := fbo.startOp(
 		ctx, "CreateDir %s %s", getNodeIDStr(dir), path)
@@ -4483,8 +4633,8 @@ func (fbo *folderBranchOps) CreateDir(
 }
 
 func (fbo *folderBranchOps) CreateFile(
-	ctx context.Context, dir Node, path string, isExec bool, excl Excl) (
-	n Node, ei data.EntryInfo, err error) {
+	ctx context.Context, dir Node, path data.PathPartString, isExec bool,
+	excl Excl) (n Node, ei data.EntryInfo, err error) {
 	startTime, timer := fbo.startOp(
 		ctx, "CreateFile %s %s isExec=%v Excl=%s", getNodeIDStr(dir),
 		path, isExec, excl)
@@ -4581,17 +4731,17 @@ func (fbo *folderBranchOps) notifyAndSyncOrSignal(
 }
 
 func (fbo *folderBranchOps) createLinkLocked(
-	ctx context.Context, lState *kbfssync.LockState, dir Node, fromName string,
-	toPath string) (data.DirEntry, error) {
+	ctx context.Context, lState *kbfssync.LockState, dir Node,
+	fromName, toPath data.PathPartString) (data.DirEntry, error) {
 	fbo.mdWriterLock.AssertLocked(lState)
 
 	if err := checkDisallowedPrefixes(ctx, fromName); err != nil {
 		return data.DirEntry{}, err
 	}
 
-	if uint32(len(fromName)) > fbo.config.MaxNameBytes() {
+	if uint32(len(fromName.Plaintext())) > fbo.config.MaxNameBytes() {
 		return data.DirEntry{},
-			NameTooLongError{fromName, fbo.config.MaxNameBytes()}
+			NameTooLongError{fromName.Plaintext(), fbo.config.MaxNameBytes()}
 	}
 
 	if err := fbo.checkForUnlinkedDir(dir); err != nil {
@@ -4613,15 +4763,16 @@ func (fbo *folderBranchOps) createLinkLocked(
 
 	// does name already exist?
 	_, err = fbo.blocks.GetEntry(
-		ctx, lState, md.ReadOnly(), dirPath.ChildPathNoPtr(fromName))
+		ctx, lState, md.ReadOnly(), dirPath.ChildPathNoPtr(
+			fromName, fbo.makeObfuscator()))
 	if err == nil {
-		return data.DirEntry{}, data.NameExistsError{Name: fromName}
+		return data.DirEntry{}, data.NameExistsError{Name: fromName.String()}
 	} else if _, notExists := errors.Cause(err).(idutil.NoSuchNameError); !notExists {
 		return data.DirEntry{}, err
 	}
 
 	parentPtr := dirPath.TailPointer()
-	co, err := newCreateOp(fromName, parentPtr, data.Sym)
+	co, err := newCreateOp(fromName.Plaintext(), parentPtr, data.Sym)
 	if err != nil {
 		return data.DirEntry{}, err
 	}
@@ -4634,11 +4785,12 @@ func (fbo *folderBranchOps) createLinkLocked(
 
 	// Create a direntry for the link, and then sync
 	now := fbo.nowUnixNano()
+	toPathPlain := toPath.Plaintext()
 	de := data.DirEntry{
 		EntryInfo: data.EntryInfo{
 			Type:    data.Sym,
-			Size:    uint64(len(toPath)),
-			SymPath: toPath,
+			Size:    uint64(len(toPathPlain)),
+			SymPath: toPathPlain,
 			Mtime:   now,
 			Ctime:   now,
 		},
@@ -4659,7 +4811,7 @@ func (fbo *folderBranchOps) createLinkLocked(
 }
 
 func (fbo *folderBranchOps) CreateLink(
-	ctx context.Context, dir Node, fromName string, toPath string) (
+	ctx context.Context, dir Node, fromName, toPath data.PathPartString) (
 	ei data.EntryInfo, err error) {
 	startTime, timer := fbo.startOp(ctx, "CreateLink %s %s -> %s",
 		getNodeIDStr(dir), fromName, toPath)
@@ -4692,8 +4844,8 @@ func (fbo *folderBranchOps) CreateLink(
 // unrefEntry modifies md to unreference all relevant blocks for the
 // given entry.
 func (fbo *folderBranchOps) unrefEntryLocked(ctx context.Context,
-	lState *kbfssync.LockState, kmd libkey.KeyMetadata, ro op, dir data.Path, de data.DirEntry,
-	name string) error {
+	lState *kbfssync.LockState, kmd libkey.KeyMetadata, ro op, dir data.Path,
+	de data.DirEntry, name data.PathPartString) error {
 	fbo.mdWriterLock.AssertLocked(lState)
 	if de.Type == data.Sym {
 		return nil
@@ -4703,7 +4855,8 @@ func (fbo *folderBranchOps) unrefEntryLocked(ctx context.Context,
 	fbo.prepper.cacheBlockInfos([]data.BlockInfo{de.BlockInfo})
 	unrefsToAdd[de.BlockPointer] = true
 	// construct a path for the child so we can unlink with it.
-	childPath := dir.ChildPath(name, de.BlockPointer)
+	childPath := dir.ChildPath(
+		name, de.BlockPointer, fbo.makeObfuscator())
 
 	// If this is an indirect block, we need to delete all of its
 	// children as well. NOTE: non-empty directories can't be
@@ -4745,8 +4898,8 @@ func (fbo *folderBranchOps) unrefEntryLocked(ctx context.Context,
 }
 
 func (fbo *folderBranchOps) removeEntryLocked(ctx context.Context,
-	lState *kbfssync.LockState, md ReadOnlyRootMetadata, dir Node, dirPath data.Path,
-	name string) error {
+	lState *kbfssync.LockState, md ReadOnlyRootMetadata, dir Node,
+	dirPath data.Path, name data.PathPartString) error {
 	fbo.mdWriterLock.AssertLocked(lState)
 
 	if err := fbo.checkForUnlinkedDir(dir); err != nil {
@@ -4755,15 +4908,16 @@ func (fbo *folderBranchOps) removeEntryLocked(ctx context.Context,
 
 	// make sure the entry exists
 	de, err := fbo.blocks.GetEntry(
-		ctx, lState, md, dirPath.ChildPathNoPtr(name))
+		ctx, lState, md, dirPath.ChildPathNoPtr(
+			name, fbo.makeObfuscator()))
 	if _, notExists := errors.Cause(err).(idutil.NoSuchNameError); notExists {
-		return idutil.NoSuchNameError{Name: name}
+		return idutil.NoSuchNameError{Name: name.String()}
 	} else if err != nil {
 		return err
 	}
 
 	parentPtr := dirPath.TailPointer()
-	ro, err := newRmOp(name, parentPtr, de.Type)
+	ro, err := newRmOp(name.Plaintext(), parentPtr, de.Type)
 	if err != nil {
 		return err
 	}
@@ -4802,7 +4956,8 @@ func (fbo *folderBranchOps) removeEntryLocked(ctx context.Context,
 }
 
 func (fbo *folderBranchOps) removeDirLocked(ctx context.Context,
-	lState *kbfssync.LockState, dir Node, dirName string) (err error) {
+	lState *kbfssync.LockState, dir Node, dirName data.PathPartString) (
+	err error) {
 	fbo.mdWriterLock.AssertLocked(lState)
 
 	// Verify we have permission to write (but don't make a successor yet).
@@ -4816,16 +4971,17 @@ func (fbo *folderBranchOps) removeDirLocked(ctx context.Context,
 		return err
 	}
 
+	ob := fbo.makeObfuscator()
 	de, err := fbo.blocks.GetEntry(
-		ctx, lState, md.ReadOnly(), dirPath.ChildPathNoPtr(dirName))
+		ctx, lState, md.ReadOnly(), dirPath.ChildPathNoPtr(dirName, ob))
 	if _, notExists := errors.Cause(err).(idutil.NoSuchNameError); notExists {
-		return idutil.NoSuchNameError{Name: dirName}
+		return idutil.NoSuchNameError{Name: dirName.String()}
 	} else if err != nil {
 		return err
 	}
 
 	// construct a path for the child so we can check for an empty dir
-	childPath := dirPath.ChildPath(dirName, de.BlockPointer)
+	childPath := dirPath.ChildPath(dirName, de.BlockPointer, ob)
 
 	// Note this fetches all the blocks associated with this
 	// directory, even though technically we just need to find one
@@ -4848,7 +5004,7 @@ func (fbo *folderBranchOps) removeDirLocked(ctx context.Context,
 }
 
 func (fbo *folderBranchOps) RemoveDir(
-	ctx context.Context, dir Node, dirName string) (err error) {
+	ctx context.Context, dir Node, dirName data.PathPartString) (err error) {
 	startTime, timer := fbo.startOp(
 		ctx, "RemoveDir %s %s", getNodeIDStr(dir), dirName)
 	defer func() {
@@ -4877,7 +5033,7 @@ func (fbo *folderBranchOps) RemoveDir(
 }
 
 func (fbo *folderBranchOps) RemoveEntry(ctx context.Context, dir Node,
-	name string) (err error) {
+	name data.PathPartString) (err error) {
 	startTime, timer := fbo.startOp(
 		ctx, "RemoveEntry %s %s", getNodeIDStr(dir), name)
 	defer func() {
@@ -4912,7 +5068,8 @@ func (fbo *folderBranchOps) RemoveEntry(ctx context.Context, dir Node,
 
 func (fbo *folderBranchOps) renameLocked(
 	ctx context.Context, lState *kbfssync.LockState, oldParent Node,
-	oldName string, newParent Node, newName string) (err error) {
+	oldName data.PathPartString, newParent Node, newName data.PathPartString) (
+	err error) {
 	fbo.mdWriterLock.AssertLocked(lState)
 
 	if err := fbo.checkForUnlinkedDir(oldParent); err != nil {
@@ -4953,17 +5110,18 @@ func (fbo *folderBranchOps) renameLocked(
 	// does name exist?
 	if replacedDe.IsInitialized() {
 		// Usually higher-level programs check these, but just in case.
+		ob := fbo.makeObfuscator()
 		if replacedDe.Type == data.Dir && newDe.Type != data.Dir {
-			return NotDirError{newParentPath.ChildPathNoPtr(newName)}
+			return NotDirError{newParentPath.ChildPathNoPtr(newName, ob)}
 		} else if replacedDe.Type != data.Dir && newDe.Type == data.Dir {
-			return NotFileError{newParentPath.ChildPathNoPtr(newName)}
+			return NotFileError{newParentPath.ChildPathNoPtr(newName, ob)}
 		}
 
 		if replacedDe.Type == data.Dir {
 			// The directory must be empty.
 			entries, err := fbo.blocks.GetEntries(
 				ctx, lState, md.ReadOnly(),
-				newParentPath.ChildPath(newName, replacedDe.BlockPointer))
+				newParentPath.ChildPath(newName, replacedDe.BlockPointer, ob))
 			if err != nil {
 				return err
 			}
@@ -5001,8 +5159,8 @@ func (fbo *folderBranchOps) renameLocked(
 }
 
 func (fbo *folderBranchOps) Rename(
-	ctx context.Context, oldParent Node, oldName string, newParent Node,
-	newName string) (err error) {
+	ctx context.Context, oldParent Node, oldName data.PathPartString,
+	newParent Node, newName data.PathPartString) (err error) {
 	startTime, timer := fbo.startOp(
 		ctx, "Rename %s/%s -> %s/%s", getNodeIDStr(oldParent),
 		oldName, getNodeIDStr(newParent), newName)
@@ -5056,6 +5214,12 @@ func (fbo *folderBranchOps) Read(
 		defer fsFile.Close()
 		fbo.vlog.CLogf(ctx, libkb.VLog1, "Reading from an FS file")
 		nInt, err := fsFile.ReadAt(dest, off)
+		if nInt == 0 && errors.Cause(err) == io.EOF {
+			// The billy interfaces requires an EOF when you start
+			// reading past the end of a file, but the libkbfs
+			// interface wants a nil error in that case.
+			err = nil
+		}
 		return int64(nInt), err
 	}
 
@@ -5077,7 +5241,7 @@ func (fbo *folderBranchOps) Read(
 		// try to fix git.
 		if _, isSet := os.LookupEnv("KBFS_DISABLE_GIT_SPECIAL_CASE"); !isSet {
 			for _, n := range filePath.Path {
-				if n.Name == ".git" {
+				if n.Name.Plaintext() == ".git" {
 					libcontext.EnableDelayedCancellationWithGracePeriod(
 						ctx, fbo.config.DelayedCancellationGracePeriod())
 					break
@@ -5236,8 +5400,9 @@ func (fbo *folderBranchOps) setExLocked(
 	de.Ctime = fbo.nowUnixNano()
 
 	parentPtr := filePath.ParentPath().TailPointer()
-	sao, err := newSetAttrOp(filePath.TailName(), parentPtr,
-		exAttr, filePath.TailPointer())
+	sao, err := newSetAttrOp(
+		filePath.TailName().Plaintext(), parentPtr, exAttr,
+		filePath.TailPointer())
 	if err != nil {
 		return err
 	}
@@ -5315,8 +5480,9 @@ func (fbo *folderBranchOps) setMtimeLocked(
 	de.Ctime = fbo.nowUnixNano()
 
 	parentPtr := filePath.ParentPath().TailPointer()
-	sao, err := newSetAttrOp(filePath.TailName(), parentPtr,
-		mtimeAttr, filePath.TailPointer())
+	sao, err := newSetAttrOp(
+		filePath.TailName().Plaintext(), parentPtr, mtimeAttr,
+		filePath.TailPointer())
 	if err != nil {
 		return err
 	}
@@ -5471,6 +5637,7 @@ func (fbo *folderBranchOps) syncAllLocked(
 
 	dirtyFiles := fbo.blocks.GetDirtyFileBlockRefs(lState)
 	dirtyDirs := fbo.blocks.GetDirtyDirBlockRefs(lState)
+	defer fbo.blocks.GetDirtyDirBlockRefsDone(lState)
 	if len(dirtyFiles) == 0 && len(dirtyDirs) == 0 {
 		return nil
 	}
@@ -5756,7 +5923,8 @@ func (fbo *folderBranchOps) syncAllLocked(
 		}
 		resolvedPaths[file.TailPointer()] = file
 		parent := file.ParentPath().TailPointer()
-		err = fileBlocks.putTopBlock(ctx, parent, file.TailName(), fblock)
+		err = fileBlocks.putTopBlock(
+			ctx, parent, file.TailName().Plaintext(), fblock)
 		if err != nil {
 			return err
 		}
@@ -5819,7 +5987,7 @@ func (fbo *folderBranchOps) syncAllLocked(
 	// them.
 	syncChains.doNotUnrefPointers = syncChains.createdOriginals
 	head, _ := fbo.getHead(ctx, lState, mdNoCommit)
-	dummyHeadChains := newCRChainsEmpty()
+	dummyHeadChains := newCRChainsEmpty(fbo.makeObfuscator)
 	dummyHeadChains.mostRecentChainMDInfo = head
 
 	// Squash the batch of updates together into a set of blocks and
@@ -5961,6 +6129,24 @@ func (fbo *folderBranchOps) FolderStatus(
 	return fbo.status.getStatus(ctx, &fbo.blocks)
 }
 
+func (fbo *folderBranchOps) FolderConflictStatus(ctx context.Context) (
+	keybase1.FolderConflictType, error) {
+	isStuck, err := fbo.cr.isStuck()
+	if err != nil {
+		return keybase1.FolderConflictType_NONE, err
+	}
+
+	if isStuck {
+		return keybase1.FolderConflictType_IN_CONFLICT_AND_STUCK, nil
+	}
+
+	lState := makeFBOLockState()
+	if fbo.isUnmerged(lState) {
+		return keybase1.FolderConflictType_IN_CONFLICT, nil
+	}
+	return keybase1.FolderConflictType_NONE, nil
+}
+
 func (fbo *folderBranchOps) Status(
 	ctx context.Context) (
 	fbs KBFSStatus, updateChan <-chan StatusUpdate, err error) {
@@ -6038,7 +6224,7 @@ func (fbo *folderBranchOps) getUnlinkPathBeforeUpdatingPointers(
 	}
 
 	var node Node
-	var childName string
+	var childName data.PathPartString
 
 	requireResFix := false
 	switch realOp := op.(type) {
@@ -6047,7 +6233,7 @@ func (fbo *folderBranchOps) getUnlinkPathBeforeUpdatingPointers(
 			requireResFix = true
 		}
 		node = fbo.nodeCache.Get(realOp.Dir.Unref.Ref())
-		childName = realOp.OldName
+		childName = realOp.obfuscatedOldName()
 	case *renameOp:
 		if realOp.NewDir.Unref != data.ZeroPtr {
 			// moving to a new dir
@@ -6062,7 +6248,7 @@ func (fbo *folderBranchOps) getUnlinkPathBeforeUpdatingPointers(
 			}
 			node = fbo.nodeCache.Get(realOp.OldDir.Unref.Ref())
 		}
-		childName = realOp.NewName
+		childName = realOp.obfuscatedNewName()
 	}
 	if node == nil {
 		return data.Path{}, data.DirEntry{}, false, nil
@@ -6108,14 +6294,15 @@ func (fbo *folderBranchOps) getUnlinkPathBeforeUpdatingPointers(
 	// If the original (clean) parent block is already GC'd from the
 	// server, this might not work, but hopefully we'd be
 	// fast-forwarding in that case anyway.
-	childPath := p.ChildPathNoPtr(childName)
+	ob := fbo.makeObfuscator()
+	childPath := p.ChildPathNoPtr(childName, ob)
 	de, err := fbo.blocks.GetEntry(ctx, lState, md, childPath)
 	if err != nil {
 		fbo.log.CDebugf(ctx, "Couldn't get the dir entry for %s in %v: %+v",
 			childName, p.TailPointer(), err)
 		return data.Path{}, data.DirEntry{}, false, nil
 	}
-	childPath = p.ChildPath(childName, de.BlockPointer)
+	childPath = p.ChildPath(childName, de.BlockPointer, ob)
 	return childPath, de, true, nil
 }
 
@@ -6163,7 +6350,7 @@ func (fbo *folderBranchOps) notifyOneOpLocked(ctx context.Context,
 			realOp.NewName, getNodeIDStr(node))
 		changes = append(changes, NodeChange{
 			Node:       node,
-			DirUpdated: []string{realOp.NewName},
+			DirUpdated: []data.PathPartString{realOp.obfuscatedNewName()},
 		})
 	case *rmOp:
 		node := fbo.nodeCache.Get(realOp.Dir.Ref.Ref())
@@ -6174,7 +6361,7 @@ func (fbo *folderBranchOps) notifyOneOpLocked(ctx context.Context,
 			realOp.OldName, getNodeIDStr(node))
 		changes = append(changes, NodeChange{
 			Node:       node,
-			DirUpdated: []string{realOp.OldName},
+			DirUpdated: []data.PathPartString{realOp.obfuscatedOldName()},
 		})
 
 		// If this node exists, then the child node might exist too,
@@ -6187,7 +6374,7 @@ func (fbo *folderBranchOps) notifyOneOpLocked(ctx context.Context,
 		if oldNode != nil {
 			changes = append(changes, NodeChange{
 				Node:       oldNode,
-				DirUpdated: []string{realOp.OldName},
+				DirUpdated: []data.PathPartString{realOp.obfuscatedOldName()},
 			})
 		}
 		var newNode Node
@@ -6195,8 +6382,9 @@ func (fbo *folderBranchOps) notifyOneOpLocked(ctx context.Context,
 			newNode = fbo.nodeCache.Get(realOp.NewDir.Ref.Ref())
 			if newNode != nil {
 				changes = append(changes, NodeChange{
-					Node:       newNode,
-					DirUpdated: []string{realOp.NewName},
+					Node: newNode,
+					DirUpdated: []data.PathPartString{
+						realOp.obfuscatedNewName()},
 				})
 			}
 		} else {
@@ -6204,7 +6392,8 @@ func (fbo *folderBranchOps) notifyOneOpLocked(ctx context.Context,
 			if oldNode != nil {
 				// Add another name to the existing NodeChange.
 				changes[len(changes)-1].DirUpdated =
-					append(changes[len(changes)-1].DirUpdated, realOp.NewName)
+					append(changes[len(changes)-1].DirUpdated,
+						realOp.obfuscatedNewName())
 			}
 		}
 
@@ -6239,7 +6428,7 @@ func (fbo *folderBranchOps) notifyOneOpLocked(ctx context.Context,
 						unlinkDe.Ref(), unlinkPath, unlinkDe)
 				}
 				_, err := fbo.nodeCache.Move(
-					realOp.Renamed.Ref(), newNode, realOp.NewName)
+					realOp.Renamed.Ref(), newNode, realOp.obfuscatedNewName())
 				if err != nil {
 					return err
 				}
@@ -6317,7 +6506,7 @@ func (fbo *folderBranchOps) notifyOneOpLocked(ctx context.Context,
 			if parentNode != nil {
 				changes = append(changes, NodeChange{
 					Node:       parentNode,
-					DirUpdated: []string{p.TailName()},
+					DirUpdated: []data.PathPartString{p.TailName()},
 				})
 			}
 
@@ -6392,7 +6581,7 @@ func (fbo *folderBranchOps) applyMDUpdatesLocked(ctx context.Context,
 	// If there's anything in the journal, don't apply these MDs.
 	// Wait for CR to happen.
 	if !fbo.isUnmergedLocked(lState) {
-		mergedRev, err := fbo.getJournalPredecessorRevision(ctx)
+		mergedRev, journalEnd, err := fbo.getJournalRevisions(ctx)
 		if err == errNoFlushedRevisions {
 			// If the journal is still on the initial revision, ignore
 			// the error and fall through to ignore CR.
@@ -6401,9 +6590,11 @@ func (fbo *folderBranchOps) applyMDUpdatesLocked(ctx context.Context,
 			return err
 		}
 		if mergedRev != kbfsmd.RevisionUninitialized {
-			if len(rmds) > 0 {
-				// We should update our view of the merged master though,
-				// to avoid re-registering for the same updates again.
+			if latestMerged.Revision() > journalEnd {
+				// If somehow we fetch more revisions than our journal
+				// knows about, we should update our view of the
+				// merged master, to avoid re-registering for the same
+				// updates again.
 				func() {
 					fbo.headLock.Lock(lState)
 					defer fbo.headLock.Unlock(lState)
@@ -6769,7 +6960,7 @@ func (fbo *folderBranchOps) undoUnmergedMDUpdatesLocked(
 			for _, ptr := range op.Refs() {
 				if ptr != data.ZeroPtr {
 					unflushed, err := fbo.config.BlockServer().IsUnflushed(
-						ctx, rmd.tlfHandle.TlfID(), ptr.ID)
+						ctx, fbo.id(), ptr.ID)
 					if err != nil {
 						return nil, err
 					}
@@ -6781,7 +6972,7 @@ func (fbo *folderBranchOps) undoUnmergedMDUpdatesLocked(
 			for _, update := range op.allUpdates() {
 				if update.Ref != data.ZeroPtr {
 					unflushed, err := fbo.config.BlockServer().IsUnflushed(
-						ctx, rmd.tlfHandle.TlfID(), update.Ref.ID)
+						ctx, fbo.id(), update.Ref.ID)
 					if err != nil {
 						return nil, err
 					}
@@ -6827,13 +7018,9 @@ func (fbo *folderBranchOps) unstageLocked(ctx context.Context,
 			return err
 		}
 
-		if tlfJournal, ok := jManager.getTLFJournal(fbo.id(), nil); ok {
-			err = tlfJournal.moveAway(ctx)
-			if err != nil {
-				return err
-			}
-		} else {
-			return errJournalNotAvailable
+		err = jManager.MoveAway(ctx, fbo.id())
+		if err != nil {
+			return err
 		}
 	}
 
@@ -7129,7 +7316,21 @@ func (fbo *folderBranchOps) SyncFromServer(ctx context.Context,
 		return err
 	}
 
-	if !fbo.config.MDServer().IsConnected() {
+	// MDServer.IsConnected() takes some time to work when you get
+	// disconnected from inside the network (as we do in a test).  To
+	// get a quick result, force a reachability check with a short
+	// timeout, and if it times out, assume we're disconnected.
+	mdserver := fbo.config.MDServer()
+	timeoutCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	mdserver.CheckReachability(timeoutCtx)
+	timedOut := false
+	select {
+	case <-timeoutCtx.Done():
+		timedOut = true
+	default:
+	}
+	if lockBeforeGet == nil && (timedOut || !mdserver.IsConnected()) {
 		fbo.vlog.CLogf(
 			ctx, libkb.VLog1, "Not fetching new updates while offline")
 		return nil
@@ -7209,11 +7410,24 @@ func (fbo *folderBranchOps) SyncFromServer(ctx context.Context,
 		}
 	}
 
-	if err := fbo.fbm.waitForQuotaReclamations(ctx); err != nil {
-		return err
+	// Same with block-related activity, when the bserver might be offline.
+	qrCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	if err := fbo.fbm.waitForQuotaReclamations(qrCtx); err != nil {
+		if err == context.DeadlineExceeded {
+			fbo.log.CDebugf(ctx, "Couldn't wait for qr activity")
+		} else {
+			return err
+		}
 	}
-	if err := fbo.fbm.waitForDiskCacheCleans(ctx); err != nil {
-		return err
+	cleanCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	if err := fbo.fbm.waitForDiskCacheCleans(cleanCtx); err != nil {
+		if err == context.DeadlineExceeded {
+			fbo.log.CDebugf(ctx, "Couldn't wait for disk clean activity")
+		} else {
+			return err
+		}
 	}
 	if err := fbo.partialSyncs.Wait(ctx); err != nil {
 		return err
@@ -7776,8 +7990,10 @@ func (fbo *folderBranchOps) finalizeResolutionLocked(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	irmd, err := fbo.config.MDOps().ResolveBranch(ctx, fbo.id(), fbo.unmergedBID,
-		blocksToDelete, md, session.VerifyingKey)
+	irmd, err := fbo.config.MDOps().ResolveBranch(
+		ctx, fbo.id(), fbo.unmergedBID, blocksToDelete, md,
+		session.VerifyingKey, bps)
+	md = irmd.ReadOnlyRootMetadata.RootMetadata // un-read-onlyify
 	doUnmergedPut := isRevisionConflict(err)
 	if doUnmergedPut {
 		fbo.log.CDebugf(ctx, "Got a conflict after resolution; aborting CR")
@@ -7790,12 +8006,6 @@ func (fbo *folderBranchOps) finalizeResolutionLocked(ctx context.Context,
 	// Queue a rekey if the bit was set.
 	if md.IsRekeySet() {
 		defer fbo.config.RekeyQueue().Enqueue(md.TlfID())
-	}
-
-	md, irmd, err = fbo.loadCachedMDChanges(ctx, bps,
-		session.VerifyingKey, md, irmd)
-	if err != nil {
-		return err
 	}
 
 	// Set the head to the new MD.
@@ -8151,7 +8361,8 @@ func (fbo *folderBranchOps) MigrateToImplicitTeam(
 
 	fbo.log.CDebugf(ctx, "Starting migration of TLF %s", id)
 	defer func() {
-		fbo.log.CDebugf(ctx, "Finished migration of TLF %s, err=%+v", id, err)
+		fbo.deferLog.CDebugf(
+			ctx, "Finished migration of TLF %s, err=%+v", id, err)
 	}()
 
 	if id.Type() != tlf.Private && id.Type() != tlf.Public {
@@ -8311,7 +8522,7 @@ func (fbo *folderBranchOps) PushStatusChange() {
 // folderBranchOps.
 func (fbo *folderBranchOps) ClearPrivateFolderMD(ctx context.Context) {
 	func() {
-		// Cancel the edits goroutine and forget the old history, evem
+		// Cancel the edits goroutine and forget the old history, even
 		// for public folders, since some of the state in the history
 		// is dependent on your login state.
 		fbo.editsLock.Lock()
@@ -8369,6 +8580,12 @@ func (fbo *folderBranchOps) ClearPrivateFolderMD(ctx context.Context) {
 	fbo.headStatus = headUntrusted
 	fbo.latestMergedRevision = kbfsmd.RevisionUninitialized
 	fbo.hasBeenCleared = true
+
+	// Clear the log obfuscation secret as well, so it can be re-set
+	// when the head is re-established.
+	fbo.obLock.Lock()
+	defer fbo.obLock.Unlock()
+	fbo.obSecret = nil
 }
 
 // ForceFastForward implements the KBFSOps interface for
@@ -8455,6 +8672,35 @@ func (fbo *folderBranchOps) ForceFastForward(ctx context.Context) {
 	})
 }
 
+func (fbo *folderBranchOps) invalidateAllNodesLocked(
+	ctx context.Context, lState *kbfssync.LockState) error {
+	fbo.mdWriterLock.AssertLocked(lState)
+	fbo.headLock.AssertLocked(lState)
+
+	changes, affectedNodeIDs, err := fbo.blocks.GetInvalidationChangesForAll(
+		ctx, lState)
+	if err != nil {
+		return err
+	}
+
+	// Invalidate all the affected nodes.
+	if len(changes) > 0 {
+		fbo.observers.batchChanges(ctx, changes, affectedNodeIDs)
+	}
+	return nil
+}
+
+func (fbo *folderBranchOps) invalidateAllNodes(ctx context.Context) error {
+	lState := makeFBOLockState()
+	fbo.mdWriterLock.Lock(lState)
+	defer fbo.mdWriterLock.Unlock(lState)
+	fbo.headLock.Lock(lState)
+	defer fbo.headLock.Unlock(lState)
+
+	fbo.log.CDebugf(ctx, "Invalidating all nodes")
+	return fbo.invalidateAllNodesLocked(ctx, lState)
+}
+
 // Reset implements the KBFSOps interface for folderBranchOps.
 func (fbo *folderBranchOps) Reset(
 	ctx context.Context, handle *tlfhandle.Handle) error {
@@ -8480,15 +8726,9 @@ func (fbo *folderBranchOps) Reset(
 	defer fbo.headLock.Unlock(lState)
 
 	fbo.log.CDebugf(ctx, "Resetting")
-	changes, affectedNodeIDs, err := fbo.blocks.GetInvalidationChangesForAll(
-		ctx, lState)
+	err = fbo.invalidateAllNodesLocked(ctx, lState)
 	if err != nil {
 		return err
-	}
-
-	// Invalidate all the affected nodes.
-	if len(changes) > 0 {
-		fbo.observers.batchChanges(ctx, changes, affectedNodeIDs)
 	}
 
 	// Make up a finalized name for the old handle, and broadcast it
@@ -8730,6 +8970,12 @@ func (fbo *folderBranchOps) SetSyncConfig(
 			}}
 	}
 
+	defer func() {
+		if err == nil {
+			fbo.config.Reporter().NotifyFavoritesChanged(ctx)
+		}
+	}()
+
 	lState := makeFBOLockState()
 	md, err := fbo.getLatestMergedMD(ctx, lState)
 	if err != nil {
@@ -8866,9 +9112,21 @@ func (fbo *folderBranchOps) SetSyncConfig(
 	}
 
 	if config.Mode == keybase1.FolderSyncMode_ENABLED {
-		fbo.log.CDebugf(ctx, "Starting full deep sync")
-		_ = fbo.kickOffRootBlockFetch(ctx, md)
+		// Make a new ctx for the root block fetch, since it will
+		// continue after this function returns.
+		rootBlockCtx := fbo.ctxWithFBOID(context.Background())
+		fbo.log.CDebugf(
+			ctx, "Starting full deep sync with a new context: FBOID=%s",
+			rootBlockCtx.Value(CtxFBOIDKey))
+		_ = fbo.kickOffRootBlockFetch(rootBlockCtx, md)
 	}
+
+	// Issue notifications to client when sync mode changes (or is partial).
+	if oldConfig.Mode != config.Mode || config.Mode == keybase1.FolderSyncMode_PARTIAL {
+		fbo.config.Reporter().Notify(ctx, syncConfigChangeNotification(
+			md.GetTlfHandle(), config))
+	}
+
 	return ch, nil
 }
 
@@ -9117,6 +9375,7 @@ func (fbo *folderBranchOps) handleEditActivity(
 		if rmd != (ImmutableRootMetadata{}) {
 			_ = fbo.kickOffEditActivityPartialSync(ctx, lState, rmd)
 		}
+		fbo.favs.RefreshCacheWhenMTimeChanged(ctx)
 		fbo.editActivity.Done()
 	}()
 
@@ -9219,4 +9478,8 @@ func (fbo *folderBranchOps) monitorEditsChat(tlfName tlf.CanonicalName) {
 			return
 		}
 	}
+}
+
+func (fbo *folderBranchOps) addRootNodeWrapper(f func(Node) Node) {
+	fbo.nodeCache.AddRootWrapper(f)
 }

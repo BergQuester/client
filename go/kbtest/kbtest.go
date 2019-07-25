@@ -147,7 +147,7 @@ func ResetAccount(tc libkb.TestContext, u *FakeUser) {
 
 func DeleteAccount(tc libkb.TestContext, u *FakeUser) {
 	m := libkb.NewMetaContextForTest(tc)
-	err := libkb.DeleteAccount(m, u.NormalizedUsername(), u.Passphrase)
+	err := libkb.DeleteAccount(m, u.NormalizedUsername(), &u.Passphrase)
 	require.NoError(tc.T, err)
 	tc.T.Logf("Account deleted for user %s", u.Username)
 	Logout(tc)
@@ -283,8 +283,6 @@ func ProvisionNewDeviceKex(tcX *libkb.TestContext, tcY *libkb.TestContext, userX
 	}()
 
 	wg.Wait()
-
-	return
 }
 
 type TestProvisionUI struct {
@@ -343,20 +341,22 @@ type TeamNotifyListener struct {
 
 var _ libkb.NotifyListener = (*TeamNotifyListener)(nil)
 
-func (n *TeamNotifyListener) TeamChangedByID(teamID keybase1.TeamID, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet) {
+func (n *TeamNotifyListener) TeamChangedByID(teamID keybase1.TeamID, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet, latestHiddenSeqno keybase1.Seqno) {
 	n.changeByIDCh <- keybase1.TeamChangedByIDArg{
-		TeamID:       teamID,
-		LatestSeqno:  latestSeqno,
-		ImplicitTeam: implicitTeam,
-		Changes:      changes,
+		TeamID:            teamID,
+		LatestSeqno:       latestSeqno,
+		ImplicitTeam:      implicitTeam,
+		Changes:           changes,
+		LatestHiddenSeqno: latestHiddenSeqno,
 	}
 }
-func (n *TeamNotifyListener) TeamChangedByName(teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet) {
+func (n *TeamNotifyListener) TeamChangedByName(teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet, latestHiddenSeqno keybase1.Seqno) {
 	n.changeByNameCh <- keybase1.TeamChangedByNameArg{
-		TeamName:     teamName,
-		LatestSeqno:  latestSeqno,
-		ImplicitTeam: implicitTeam,
-		Changes:      changes,
+		TeamName:          teamName,
+		LatestSeqno:       latestSeqno,
+		ImplicitTeam:      implicitTeam,
+		Changes:           changes,
+		LatestHiddenSeqno: latestHiddenSeqno,
 	}
 }
 

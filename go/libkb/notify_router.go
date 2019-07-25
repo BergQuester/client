@@ -34,6 +34,7 @@ type NotifyListener interface {
 	ClientOutOfDate(to, uri, msg string)
 	UserChanged(uid keybase1.UID)
 	TrackingChanged(uid keybase1.UID, username NormalizedUsername)
+	TrackingInfo(uid keybase1.UID, followers, followees []string)
 	FSOnlineStatusChanged(online bool)
 	FSActivity(activity keybase1.FSNotification)
 	FSPathUpdated(path string)
@@ -42,7 +43,10 @@ type NotifyListener interface {
 	FSSyncEvent(arg keybase1.FSPathSyncStatus)
 	FSEditListRequest(arg keybase1.FSEditListRequest)
 	FSOverallSyncStatusChanged(arg keybase1.FolderSyncStatus)
+	FSFavoritesChanged()
 	FavoritesChanged(uid keybase1.UID)
+	FSSubscriptionNotify(arg keybase1.FSSubscriptionNotifyArg)
+	FSSubscriptionNotifyPath(arg keybase1.FSSubscriptionNotifyPathArg)
 	PaperKeyCached(uid keybase1.UID, encKID keybase1.KID, sigKID keybase1.KID)
 	KeyfamilyChanged(uid keybase1.UID)
 	NewChatActivity(uid keybase1.UID, activity chat1.ChatActivity, source chat1.ChatActivitySource)
@@ -74,12 +78,16 @@ type NotifyListener interface {
 	PGPKeyInSecretStoreFile()
 	BadgeState(badgeState keybase1.BadgeState)
 	ReachabilityChanged(r keybase1.Reachability)
-	TeamChangedByID(teamID keybase1.TeamID, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet)
-	TeamChangedByName(teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet)
+	TeamChangedByID(teamID keybase1.TeamID, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet, latestHiddenSeqno keybase1.Seqno)
+	TeamChangedByName(teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet, latestHiddenSeqno keybase1.Seqno)
 	TeamDeleted(teamID keybase1.TeamID)
 	TeamExit(teamID keybase1.TeamID)
 	NewlyAddedToTeam(teamID keybase1.TeamID)
 	NewTeamEK(teamID keybase1.TeamID, generation keybase1.EkGeneration)
+	NewTeambotEK(teamID keybase1.TeamID, generation keybase1.EkGeneration)
+	TeambotEKNeeded(teamID keybase1.TeamID, botUID keybase1.UID, generation keybase1.EkGeneration)
+	NewTeambotKey(teamID keybase1.TeamID, generation keybase1.TeambotKeyGeneration)
+	TeambotKeyNeeded(teamID keybase1.TeamID, botUID keybase1.UID, generation keybase1.TeambotKeyGeneration)
 	AvatarUpdated(name string, formats []keybase1.AvatarFormat)
 	DeviceCloneCountChanged(newClones int)
 	WalletPaymentNotification(accountID stellar1.AccountID, paymentID stellar1.PaymentID)
@@ -91,13 +99,13 @@ type NotifyListener interface {
 	WalletRecentPaymentsUpdate(accountID stellar1.AccountID, firstPage stellar1.PaymentsPageLocal)
 	TeamListUnverifiedChanged(teamName string)
 	CanUserPerformChanged(teamName string)
-	PhoneNumberAdded(phoneNumber keybase1.PhoneNumber)
-	PhoneNumberVerified(phoneNumber keybase1.PhoneNumber)
-	PhoneNumberSuperseded(phoneNumber keybase1.PhoneNumber)
+	PhoneNumbersChanged(list []keybase1.UserPhoneNumber, category string, phoneNumber keybase1.PhoneNumber)
 	EmailAddressVerified(emailAddress keybase1.EmailAddress)
+	EmailsChanged(list []keybase1.Email, category string, email keybase1.EmailAddress)
 	PasswordChanged()
 	RootAuditError(msg string)
 	BoxAuditError(msg string)
+	RuntimeStatsUpdate(*keybase1.RuntimeStats)
 }
 
 type NoopNotifyListener struct{}
@@ -109,8 +117,10 @@ func (n *NoopNotifyListener) Login(username string)                             
 func (n *NoopNotifyListener) ClientOutOfDate(to, uri, msg string)                           {}
 func (n *NoopNotifyListener) UserChanged(uid keybase1.UID)                                  {}
 func (n *NoopNotifyListener) TrackingChanged(uid keybase1.UID, username NormalizedUsername) {}
+func (n *NoopNotifyListener) TrackingInfo(uid keybase1.UID, followers, followees []string)  {}
 func (n *NoopNotifyListener) FSOnlineStatusChanged(online bool)                             {}
 func (n *NoopNotifyListener) FSOverallSyncStatusChanged(status keybase1.FolderSyncStatus)   {}
+func (n *NoopNotifyListener) FSFavoritesChanged()                                           {}
 func (n *NoopNotifyListener) FSActivity(activity keybase1.FSNotification)                   {}
 func (n *NoopNotifyListener) FSPathUpdated(path string)                                     {}
 func (n *NoopNotifyListener) FSEditListResponse(arg keybase1.FSEditListArg)                 {}
@@ -118,6 +128,10 @@ func (n *NoopNotifyListener) FSSyncStatusResponse(arg keybase1.FSSyncStatusArg) 
 func (n *NoopNotifyListener) FSSyncEvent(arg keybase1.FSPathSyncStatus)                     {}
 func (n *NoopNotifyListener) FSEditListRequest(arg keybase1.FSEditListRequest)              {}
 func (n *NoopNotifyListener) FavoritesChanged(uid keybase1.UID)                             {}
+func (n *NoopNotifyListener) FSSubscriptionNotify(arg keybase1.FSSubscriptionNotifyArg) {
+}
+func (n *NoopNotifyListener) FSSubscriptionNotifyPath(arg keybase1.FSSubscriptionNotifyPathArg) {
+}
 func (n *NoopNotifyListener) PaperKeyCached(uid keybase1.UID, encKID keybase1.KID, sigKID keybase1.KID) {
 }
 func (n *NoopNotifyListener) KeyfamilyChanged(uid keybase1.UID) {}
@@ -170,16 +184,25 @@ func (n *NoopNotifyListener) ChatPromptUnfurl(uid keybase1.UID, convID chat1.Con
 func (n *NoopNotifyListener) PGPKeyInSecretStoreFile()                    {}
 func (n *NoopNotifyListener) BadgeState(badgeState keybase1.BadgeState)   {}
 func (n *NoopNotifyListener) ReachabilityChanged(r keybase1.Reachability) {}
-func (n *NoopNotifyListener) TeamChangedByID(teamID keybase1.TeamID, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet) {
+func (n *NoopNotifyListener) TeamChangedByID(teamID keybase1.TeamID, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet, latestHiddenSeqno keybase1.Seqno) {
 }
-func (n *NoopNotifyListener) TeamChangedByName(teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet) {
+func (n *NoopNotifyListener) TeamChangedByName(teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet, latestHiddenSeqno keybase1.Seqno) {
 }
-func (n *NoopNotifyListener) TeamDeleted(teamID keybase1.TeamID)                                 {}
-func (n *NoopNotifyListener) TeamExit(teamID keybase1.TeamID)                                    {}
-func (n *NoopNotifyListener) NewTeamEK(teamID keybase1.TeamID, generation keybase1.EkGeneration) {}
-func (n *NoopNotifyListener) NewlyAddedToTeam(teamID keybase1.TeamID)                            {}
-func (n *NoopNotifyListener) AvatarUpdated(name string, formats []keybase1.AvatarFormat)         {}
-func (n *NoopNotifyListener) DeviceCloneCountChanged(newClones int)                              {}
+func (n *NoopNotifyListener) TeamDeleted(teamID keybase1.TeamID)                                    {}
+func (n *NoopNotifyListener) TeamExit(teamID keybase1.TeamID)                                       {}
+func (n *NoopNotifyListener) NewTeamEK(teamID keybase1.TeamID, generation keybase1.EkGeneration)    {}
+func (n *NoopNotifyListener) NewTeambotEK(teamID keybase1.TeamID, generation keybase1.EkGeneration) {}
+func (n *NoopNotifyListener) TeambotEKNeeded(teamID keybase1.TeamID, botUID keybase1.UID,
+	generation keybase1.EkGeneration) {
+}
+func (n *NoopNotifyListener) NewTeambotKey(teamID keybase1.TeamID, generation keybase1.TeambotKeyGeneration) {
+}
+func (n *NoopNotifyListener) TeambotKeyNeeded(teamID keybase1.TeamID, botUID keybase1.UID,
+	generation keybase1.TeambotKeyGeneration) {
+}
+func (n *NoopNotifyListener) NewlyAddedToTeam(teamID keybase1.TeamID)                    {}
+func (n *NoopNotifyListener) AvatarUpdated(name string, formats []keybase1.AvatarFormat) {}
+func (n *NoopNotifyListener) DeviceCloneCountChanged(newClones int)                      {}
 func (n *NoopNotifyListener) WalletPaymentNotification(accountID stellar1.AccountID, paymentID stellar1.PaymentID) {
 }
 func (n *NoopNotifyListener) WalletPaymentStatusNotification(accountID stellar1.AccountID, paymentID stellar1.PaymentID) {
@@ -192,15 +215,17 @@ func (n *NoopNotifyListener) WalletPendingPaymentsUpdate(accountID stellar1.Acco
 }
 func (n *NoopNotifyListener) WalletRecentPaymentsUpdate(accountID stellar1.AccountID, firstPage stellar1.PaymentsPageLocal) {
 }
-func (n *NoopNotifyListener) TeamListUnverifiedChanged(teamName string)               {}
-func (n *NoopNotifyListener) CanUserPerformChanged(teamName string)                   {}
-func (n *NoopNotifyListener) PhoneNumberAdded(phoneNumber keybase1.PhoneNumber)       {}
-func (n *NoopNotifyListener) PhoneNumberVerified(phoneNumber keybase1.PhoneNumber)    {}
-func (n *NoopNotifyListener) PhoneNumberSuperseded(phoneNumber keybase1.PhoneNumber)  {}
+func (n *NoopNotifyListener) TeamListUnverifiedChanged(teamName string) {}
+func (n *NoopNotifyListener) CanUserPerformChanged(teamName string)     {}
+func (n *NoopNotifyListener) PhoneNumbersChanged(list []keybase1.UserPhoneNumber, category string, phoneNumber keybase1.PhoneNumber) {
+}
 func (n *NoopNotifyListener) EmailAddressVerified(emailAddress keybase1.EmailAddress) {}
-func (n *NoopNotifyListener) PasswordChanged()                                        {}
-func (n *NoopNotifyListener) RootAuditError(msg string)                               {}
-func (n *NoopNotifyListener) BoxAuditError(msg string)                                {}
+func (n *NoopNotifyListener) EmailsChanged(list []keybase1.Email, category string, email keybase1.EmailAddress) {
+}
+func (n *NoopNotifyListener) PasswordChanged()                          {}
+func (n *NoopNotifyListener) RootAuditError(msg string)                 {}
+func (n *NoopNotifyListener) BoxAuditError(msg string)                  {}
+func (n *NoopNotifyListener) RuntimeStatsUpdate(*keybase1.RuntimeStats) {}
 
 type NotifyListenerID string
 
@@ -324,13 +349,32 @@ func (n *NotifyRouter) HandleLogout(ctx context.Context) {
 	})
 }
 
-// HandleLogin is called whenever a user logs in. It will broadcast
-// the message to all connections who care about such a message.
+// HandleLogin is called when a user logs in.
 func (n *NotifyRouter) HandleLogin(ctx context.Context, u string) {
 	if n == nil {
 		return
 	}
-	n.G().Log.CDebugf(ctx, "+ Sending login notification, as user %q", u)
+	n.G().Log.CDebugf(ctx, "+ Sending login notification for user %q", u)
+	n.SendLogin(ctx, u, false)
+}
+
+// HandleSignup is called when a user is signed up. It will broadcast a loggedIn
+// notification with a flag to signify this was because of a signup.
+func (n *NotifyRouter) HandleSignup(ctx context.Context, u string) {
+	if n == nil {
+		return
+	}
+	n.G().Log.CDebugf(ctx, "+ Sending login notification for signup, as user %q", u)
+	n.SendLogin(ctx, u, true)
+}
+
+// SendLogin is called whenever a user logs in. It will broadcast
+// the message to all connections who care about such a message.
+func (n *NotifyRouter) SendLogin(ctx context.Context, u string, signedUp bool) {
+	if n == nil {
+		return
+	}
+	n.G().Log.CDebugf(ctx, "+ Sending login notification, as user %q, signedUp %t", u, signedUp)
 	// For all connections we currently have open...
 	ctx = CopyTagsToBackground(ctx)
 	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
@@ -341,7 +385,10 @@ func (n *NotifyRouter) HandleLogin(ctx context.Context, u string) {
 				// A send of a `LoggedIn` RPC
 				(keybase1.NotifySessionClient{
 					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
-				}).LoggedIn(ctx, u)
+				}).LoggedIn(ctx, keybase1.LoggedInArg{
+					Username: u,
+					SignedUp: signedUp,
+				})
 			}()
 		}
 		return true
@@ -444,6 +491,34 @@ func (n *NotifyRouter) HandleTrackingChanged(uid keybase1.UID, username Normaliz
 	})
 }
 
+func (n *NotifyRouter) HandleTrackingInfo(uid keybase1.UID, followers, followees []string) {
+	if n == nil {
+		return
+	}
+	arg := keybase1.TrackingInfoArg{
+		Uid:       uid,
+		Followees: followees,
+		Followers: followers,
+	}
+	// For all connections we currently have open...
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		// If the connection wants the `Tracking` notification type
+		if n.getNotificationChannels(id).Tracking {
+			// In the background do...
+			go func() {
+				// A send of a `TrackingChanged` RPC with the user's UID
+				(keybase1.NotifyTrackingClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).TrackingInfo(context.Background(), arg)
+			}()
+		}
+		return true
+	})
+	n.runListeners(func(listener NotifyListener) {
+		listener.TrackingInfo(uid, followers, followees)
+	})
+}
+
 // HandleBadgeState is called whenever the badge state changes
 // It will broadcast the messages to all curious listeners.
 func (n *NotifyRouter) HandleBadgeState(badgeState keybase1.BadgeState) {
@@ -519,6 +594,32 @@ func (n *NotifyRouter) HandleFSOverallSyncStatusChanged(status keybase1.FolderSy
 	})
 	n.runListeners(func(listener NotifyListener) {
 		listener.FSOverallSyncStatusChanged(status)
+	})
+}
+
+// HandleFSFavoritesChanged is called when the overall sync status
+// changes. It will broadcast the messages to all curious listeners.
+func (n *NotifyRouter) HandleFSFavoritesChanged() {
+	if n == nil {
+		return
+	}
+	// For all connections we currently have open...
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		// If the connection wants the `kbfs` notification type
+		if n.getNotificationChannels(id).Kbfs {
+			// In the background do...
+			go func() {
+				// A send of a `FSFavoritesChanged` RPC with the
+				// notification
+				(keybase1.NotifyFSClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).FSFavoritesChanged(context.Background())
+			}()
+		}
+		return true
+	})
+	n.runListeners(func(listener NotifyListener) {
+		listener.FSFavoritesChanged()
 	})
 }
 
@@ -720,6 +821,52 @@ func (n *NotifyRouter) HandleFavoritesChanged(uid keybase1.UID) {
 		listener.FavoritesChanged(uid)
 	})
 	n.G().Log.Debug("- Sent favorites changed notification")
+}
+
+func (n *NotifyRouter) HandleFSSubscriptionNotify(arg keybase1.FSSubscriptionNotifyArg) {
+	if n == nil {
+		return
+	}
+	// For all connections we currently have open...
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		// If the connection wants the `Kbfs` notification type
+		if n.getNotificationChannels(id).Kbfssubscription {
+			// In the background do...
+			go func() {
+				// A send of a `FSSyncActivity` RPC with the notification
+				(keybase1.NotifyFSClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).FSSubscriptionNotify(context.Background(), arg)
+			}()
+		}
+		return true
+	})
+	n.runListeners(func(listener NotifyListener) {
+		listener.FSSubscriptionNotify(arg)
+	})
+}
+
+func (n *NotifyRouter) HandleFSSubscriptionNotifyPath(arg keybase1.FSSubscriptionNotifyPathArg) {
+	if n == nil {
+		return
+	}
+	// For all connections we currently have open...
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		// If the connection wants the `Kbfs` notification type
+		if n.getNotificationChannels(id).Kbfssubscription {
+			// In the background do...
+			go func() {
+				// A send of a `FSSyncActivity` RPC with the notification
+				(keybase1.NotifyFSClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).FSSubscriptionNotifyPath(context.Background(), arg)
+			}()
+		}
+		return true
+	})
+	n.runListeners(func(listener NotifyListener) {
+		listener.FSSubscriptionNotifyPath(arg)
+	})
 }
 
 // HandleDeviceCloneNotification is called when a run of the device clone status update
@@ -1669,24 +1816,27 @@ func (n *NotifyRouter) HandleReachability(r keybase1.Reachability) {
 
 // teamID and teamName are not necessarily the same team
 func (n *NotifyRouter) HandleTeamChangedByBothKeys(ctx context.Context,
-	teamID keybase1.TeamID, teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet) {
+	teamID keybase1.TeamID, teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet,
+	latestHiddenSeqno keybase1.Seqno) {
 
-	n.HandleTeamChangedByID(ctx, teamID, latestSeqno, implicitTeam, changes)
-	n.HandleTeamChangedByName(ctx, teamName, latestSeqno, implicitTeam, changes)
+	n.HandleTeamChangedByID(ctx, teamID, latestSeqno, implicitTeam, changes, latestHiddenSeqno)
+	n.HandleTeamChangedByName(ctx, teamName, latestSeqno, implicitTeam, changes, latestHiddenSeqno)
 }
 
 func (n *NotifyRouter) HandleTeamChangedByID(ctx context.Context,
-	teamID keybase1.TeamID, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet) {
+	teamID keybase1.TeamID, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet,
+	latestHiddenSeqno keybase1.Seqno) {
 
 	if n == nil {
 		return
 	}
 
 	arg := keybase1.TeamChangedByIDArg{
-		TeamID:       teamID,
-		LatestSeqno:  latestSeqno,
-		ImplicitTeam: implicitTeam,
-		Changes:      changes,
+		TeamID:            teamID,
+		LatestSeqno:       latestSeqno,
+		ImplicitTeam:      implicitTeam,
+		Changes:           changes,
+		LatestHiddenSeqno: latestHiddenSeqno,
 	}
 
 	var wg sync.WaitGroup
@@ -1707,23 +1857,25 @@ func (n *NotifyRouter) HandleTeamChangedByID(ctx context.Context,
 	wg.Wait()
 
 	n.runListeners(func(listener NotifyListener) {
-		listener.TeamChangedByID(teamID, latestSeqno, implicitTeam, changes)
+		listener.TeamChangedByID(teamID, latestSeqno, implicitTeam, changes, latestHiddenSeqno)
 	})
 	n.G().Log.CDebugf(ctx, "- Sent TeamChangedByID notification")
 }
 
 func (n *NotifyRouter) HandleTeamChangedByName(ctx context.Context,
-	teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet) {
+	teamName string, latestSeqno keybase1.Seqno, implicitTeam bool, changes keybase1.TeamChangeSet,
+	latestHiddenSeqno keybase1.Seqno) {
 
 	if n == nil {
 		return
 	}
 
 	arg := keybase1.TeamChangedByNameArg{
-		TeamName:     teamName,
-		LatestSeqno:  latestSeqno,
-		ImplicitTeam: implicitTeam,
-		Changes:      changes,
+		TeamName:          teamName,
+		LatestSeqno:       latestSeqno,
+		ImplicitTeam:      implicitTeam,
+		Changes:           changes,
+		LatestHiddenSeqno: latestHiddenSeqno,
 	}
 
 	var wg sync.WaitGroup
@@ -1744,7 +1896,7 @@ func (n *NotifyRouter) HandleTeamChangedByName(ctx context.Context,
 	wg.Wait()
 
 	n.runListeners(func(listener NotifyListener) {
-		listener.TeamChangedByName(teamName, latestSeqno, implicitTeam, changes)
+		listener.TeamChangedByName(teamName, latestSeqno, implicitTeam, changes, latestHiddenSeqno)
 	})
 	n.G().Log.CDebugf(ctx, "- Sent TeamChanged notification")
 }
@@ -1917,7 +2069,8 @@ func (n *NotifyRouter) HandleNewlyAddedToTeam(ctx context.Context, teamID keybas
 	n.G().Log.CDebugf(ctx, "- Sent NewlyAddedToTeam notification")
 }
 
-func (n *NotifyRouter) HandleNewTeamEK(ctx context.Context, teamID keybase1.TeamID, generation keybase1.EkGeneration) {
+func (n *NotifyRouter) HandleNewTeamEK(ctx context.Context, teamID keybase1.TeamID,
+	generation keybase1.EkGeneration) {
 	if n == nil {
 		return
 	}
@@ -1949,6 +2102,140 @@ func (n *NotifyRouter) HandleNewTeamEK(ctx context.Context, teamID keybase1.Team
 	n.G().Log.CDebugf(ctx, "- Sent NewTeamEK notification")
 }
 
+func (n *NotifyRouter) HandleNewTeambotEK(ctx context.Context, teamID keybase1.TeamID,
+	generation keybase1.EkGeneration) {
+	if n == nil {
+		return
+	}
+
+	arg := keybase1.NewTeambotEkArg{
+		Id:         teamID,
+		Generation: generation,
+	}
+
+	var wg sync.WaitGroup
+	n.G().Log.CDebugf(ctx, "+ Sending NewTeambotEK notification")
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		if n.getNotificationChannels(id).Ephemeral {
+			wg.Add(1)
+			go func() {
+				(keybase1.NotifyEphemeralClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).NewTeambotEk(context.Background(), arg)
+				wg.Done()
+			}()
+		}
+		return true
+	})
+	wg.Wait()
+
+	n.runListeners(func(listener NotifyListener) {
+		listener.NewTeambotEK(teamID, generation)
+	})
+	n.G().Log.CDebugf(ctx, "- Sent NewTeambotEK notification")
+}
+
+func (n *NotifyRouter) HandleTeambotEKNeeded(ctx context.Context, teamID keybase1.TeamID,
+	botUID keybase1.UID, generation keybase1.EkGeneration) {
+	if n == nil {
+		return
+	}
+
+	arg := keybase1.TeambotEkNeededArg{
+		Id:         teamID,
+		Uid:        botUID,
+		Generation: generation,
+	}
+
+	var wg sync.WaitGroup
+	n.G().Log.CDebugf(ctx, "+ Sending TeambotEKNeeded notification")
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		if n.getNotificationChannels(id).Ephemeral {
+			wg.Add(1)
+			go func() {
+				(keybase1.NotifyEphemeralClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).TeambotEkNeeded(context.Background(), arg)
+				wg.Done()
+			}()
+		}
+		return true
+	})
+	wg.Wait()
+
+	n.runListeners(func(listener NotifyListener) {
+		listener.TeambotEKNeeded(teamID, botUID, generation)
+	})
+	n.G().Log.CDebugf(ctx, "- Sent TeambotEKNeeded notification")
+}
+
+func (n *NotifyRouter) HandleNewTeambotKey(ctx context.Context, teamID keybase1.TeamID,
+	generation keybase1.TeambotKeyGeneration) {
+	if n == nil {
+		return
+	}
+
+	arg := keybase1.NewTeambotKeyArg{
+		Id:         teamID,
+		Generation: generation,
+	}
+
+	var wg sync.WaitGroup
+	n.G().Log.CDebugf(ctx, "+ Sending NewTeambotKey notification")
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		if n.getNotificationChannels(id).Teambot {
+			wg.Add(1)
+			go func() {
+				(keybase1.NotifyTeambotClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).NewTeambotKey(context.Background(), arg)
+				wg.Done()
+			}()
+		}
+		return true
+	})
+	wg.Wait()
+
+	n.runListeners(func(listener NotifyListener) {
+		listener.NewTeambotKey(teamID, generation)
+	})
+	n.G().Log.CDebugf(ctx, "- Sent NewTeambotKey notification")
+}
+
+func (n *NotifyRouter) HandleTeambotKeyNeeded(ctx context.Context, teamID keybase1.TeamID,
+	botUID keybase1.UID, generation keybase1.TeambotKeyGeneration) {
+	if n == nil {
+		return
+	}
+
+	arg := keybase1.TeambotKeyNeededArg{
+		Id:         teamID,
+		Uid:        botUID,
+		Generation: generation,
+	}
+
+	var wg sync.WaitGroup
+	n.G().Log.CDebugf(ctx, "+ Sending TeambotKeyNeeded notification")
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		if n.getNotificationChannels(id).Teambot {
+			wg.Add(1)
+			go func() {
+				(keybase1.NotifyTeambotClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).TeambotKeyNeeded(context.Background(), arg)
+				wg.Done()
+			}()
+		}
+		return true
+	})
+	wg.Wait()
+
+	n.runListeners(func(listener NotifyListener) {
+		listener.TeambotKeyNeeded(teamID, botUID, generation)
+	})
+	n.G().Log.CDebugf(ctx, "- Sent TeambotKeyNeeded notification")
+}
+
 func (n *NotifyRouter) HandleAvatarUpdated(ctx context.Context, name string, formats []keybase1.AvatarFormat,
 	typ keybase1.AvatarUpdateType) {
 	if n == nil {
@@ -1975,7 +2262,7 @@ func (n *NotifyRouter) HandleAvatarUpdated(ctx context.Context, name string, for
 	})
 }
 
-func (n *NotifyRouter) HandlePhoneNumberAdded(ctx context.Context, phoneNumber keybase1.PhoneNumber) {
+func (n *NotifyRouter) HandlePhoneNumbersChanged(ctx context.Context, list []keybase1.UserPhoneNumber, category string, phoneNumber keybase1.PhoneNumber) {
 	if n == nil {
 		return
 	}
@@ -1984,54 +2271,18 @@ func (n *NotifyRouter) HandlePhoneNumberAdded(ctx context.Context, phoneNumber k
 			go func() {
 				(keybase1.NotifyPhoneNumberClient{
 					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
-				}).PhoneNumberAdded(context.Background(), phoneNumber)
+				}).PhoneNumbersChanged(context.Background(), keybase1.PhoneNumbersChangedArg{
+					List:        list,
+					Category:    category,
+					PhoneNumber: phoneNumber,
+				})
 			}()
 		}
 		return true
 	})
 
 	n.runListeners(func(listener NotifyListener) {
-		listener.PhoneNumberAdded(phoneNumber)
-	})
-}
-
-func (n *NotifyRouter) HandlePhoneNumberVerified(ctx context.Context, phoneNumber keybase1.PhoneNumber) {
-	if n == nil {
-		return
-	}
-	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
-		if n.getNotificationChannels(id).Team {
-			go func() {
-				(keybase1.NotifyPhoneNumberClient{
-					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
-				}).PhoneNumberVerified(context.Background(), phoneNumber)
-			}()
-		}
-		return true
-	})
-
-	n.runListeners(func(listener NotifyListener) {
-		listener.PhoneNumberVerified(phoneNumber)
-	})
-}
-
-func (n *NotifyRouter) HandlePhoneNumberSuperseded(ctx context.Context, phoneNumber keybase1.PhoneNumber) {
-	if n == nil {
-		return
-	}
-	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
-		if n.getNotificationChannels(id).Team {
-			go func() {
-				(keybase1.NotifyPhoneNumberClient{
-					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
-				}).PhoneNumberSuperseded(context.Background(), phoneNumber)
-			}()
-		}
-		return true
-	})
-
-	n.runListeners(func(listener NotifyListener) {
-		listener.PhoneNumberSuperseded(phoneNumber)
+		listener.PhoneNumbersChanged(list, category, phoneNumber)
 	})
 }
 
@@ -2052,6 +2303,30 @@ func (n *NotifyRouter) HandleEmailAddressVerified(ctx context.Context, emailAddr
 
 	n.runListeners(func(listener NotifyListener) {
 		listener.EmailAddressVerified(emailAddress)
+	})
+}
+
+func (n *NotifyRouter) HandleEmailAddressChanged(ctx context.Context, list []keybase1.Email, category string, emailAddress keybase1.EmailAddress) {
+	if n == nil {
+		return
+	}
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		if n.getNotificationChannels(id).Team {
+			go func() {
+				(keybase1.NotifyEmailAddressClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).EmailsChanged(context.Background(), keybase1.EmailsChangedArg{
+					List:     list,
+					Category: category,
+					Email:    emailAddress,
+				})
+			}()
+		}
+		return true
+	})
+
+	n.runListeners(func(listener NotifyListener) {
+		listener.EmailsChanged(list, category, emailAddress)
 	})
 }
 
@@ -2186,5 +2461,24 @@ func (n *NotifyRouter) HandleBoxAuditError(ctx context.Context, msg string) {
 
 	n.runListeners(func(listener NotifyListener) {
 		listener.BoxAuditError(msg)
+	})
+}
+
+func (n *NotifyRouter) HandleRuntimeStatsUpdate(ctx context.Context, stats *keybase1.RuntimeStats) {
+	if n == nil {
+		return
+	}
+	n.cm.ApplyAll(func(id ConnectionID, xp rpc.Transporter) bool {
+		if n.getNotificationChannels(id).Runtimestats {
+			go func() {
+				(keybase1.NotifyRuntimeStatsClient{
+					Cli: rpc.NewClient(xp, NewContextifiedErrorUnwrapper(n.G()), nil),
+				}).RuntimeStatsUpdate(ctx, stats)
+			}()
+		}
+		return true
+	})
+	n.runListeners(func(listener NotifyListener) {
+		listener.RuntimeStatsUpdate(stats)
 	})
 }

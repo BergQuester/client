@@ -68,20 +68,26 @@ func (u *smuUser) cleanup() {
 			d.service.Stop(0)
 			d.stop()
 		}
+		for _, cl := range d.clones {
+			cl.Cleanup()
+		}
+		for _, cl := range d.usedClones {
+			cl.Cleanup()
+		}
 	}
 }
 
 // smuDeviceWrapper wraps a mock "device", meaning an independent running service and
 // some connected clients.
 type smuDeviceWrapper struct {
-	ctx       *smuContext
-	tctx      *libkb.TestContext
-	clones    []*libkb.TestContext
-	deviceKey keybase1.PublicKey
-	stopCh    chan error
-	service   *service.Service
-	cli       rpc.GenericClient
-	xp        rpc.Transporter
+	ctx                *smuContext
+	tctx               *libkb.TestContext
+	clones, usedClones []*libkb.TestContext
+	deviceKey          keybase1.PublicKey
+	stopCh             chan error
+	service            *service.Service
+	cli                rpc.GenericClient
+	xp                 rpc.Transporter
 }
 
 func (d *smuDeviceWrapper) KID() keybase1.KID {
@@ -129,7 +135,7 @@ func (t smuTerminalUI) PromptPasswordMaybeScripted(libkb.PromptDescriptor, strin
 func (t smuTerminalUI) PromptYesNo(libkb.PromptDescriptor, string, libkb.PromptDefault) (bool, error) {
 	return false, nil
 }
-func (t smuTerminalUI) Tablify(headings []string, rowfunc func() []string) { return }
+func (t smuTerminalUI) Tablify(headings []string, rowfunc func() []string) {}
 func (t smuTerminalUI) TerminalSize() (width int, height int)              { return }
 
 type signupInfoSecretUI struct {
@@ -169,6 +175,12 @@ func (s usernameLoginUI) PromptResetAccount(_ context.Context, arg keybase1.Prom
 func (s usernameLoginUI) DisplayResetProgress(_ context.Context, arg keybase1.DisplayResetProgressArg) error {
 	return nil
 }
+func (s usernameLoginUI) ExplainDeviceRecovery(_ context.Context, arg keybase1.ExplainDeviceRecoveryArg) error {
+	return nil
+}
+func (s usernameLoginUI) PromptPassphraseRecovery(_ context.Context, arg keybase1.PromptPassphraseRecoveryArg) (bool, error) {
+	return false, nil
+}
 
 func (d *smuDeviceWrapper) popClone() *libkb.TestContext {
 	if len(d.clones) == 0 {
@@ -176,6 +188,8 @@ func (d *smuDeviceWrapper) popClone() *libkb.TestContext {
 	}
 	ret := d.clones[0]
 	d.clones = d.clones[1:]
+	// Hold a reference to this clone for cleanup
+	d.usedClones = append(d.usedClones, ret)
 	ui := genericUI{
 		g:          ret.G,
 		TerminalUI: smuTerminalUI{},

@@ -45,7 +45,18 @@ func testImplicitTeamRotateOnRevoke(t *testing.T, public bool) {
 	secretBefore := before.Data.PerTeamKeySeedsUnverified[before.Generation()].Seed.ToBytes()
 
 	bob.revokePaperKey()
-	alice.waitForRotateByID(team, keybase1.Seqno(2))
+
+	// We wait for different chain arrangements based on whether this was a public or private rotation
+	var visible, hidden keybase1.Seqno
+	if public {
+		visible = keybase1.Seqno(2)
+		hidden = keybase1.Seqno(0)
+	} else {
+		visible = keybase1.Seqno(1)
+		hidden = keybase1.Seqno(1)
+	}
+
+	alice.waitForAnyRotateByID(team, visible, hidden)
 
 	// check that key was rotated for team
 	after, err := GetTeamForTestByID(context.TODO(), alice.tc.G, team, public)
@@ -239,6 +250,7 @@ func trySBSConsolidation(t *testing.T, impteamExpr string, public bool) {
 		})
 		require.NoError(t, err)
 		displayName, err := team.ImplicitTeamDisplayName(context.Background())
+		require.NoError(t, err)
 		t.Logf("Got team back: %q (waiting for %q)", displayName.String(), expectedTeamName)
 		return displayName.String() == expectedTeamName
 	})
@@ -342,6 +354,7 @@ func TestImplicitSBSPukless(t *testing.T) {
 		})
 		require.NoError(t, err)
 		displayName, err := team.ImplicitTeamDisplayName(context.Background())
+		require.NoError(t, err)
 		t.Logf("Got team back: %s", displayName.String())
 		return displayName.String() == expectedTeamName
 	})

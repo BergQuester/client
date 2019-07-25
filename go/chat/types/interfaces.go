@@ -3,7 +3,9 @@ package types
 import (
 	"io"
 	"regexp"
+	"time"
 
+	"github.com/keybase/client/go/badges"
 	"github.com/keybase/client/go/chat/s3"
 	"github.com/keybase/client/go/gregor"
 	"github.com/keybase/client/go/libkb"
@@ -30,9 +32,18 @@ type Suspendable interface {
 	Resume(ctx context.Context) bool
 }
 
+type BackgroundRunnable interface {
+	IsBackgroundActive() bool
+}
+
 type CryptKey interface {
 	Material() keybase1.Bytes32
 	Generation() int
+}
+
+type EphemeralCryptKey interface {
+	Material() keybase1.Bytes32
+	Generation() keybase1.EkGeneration
 }
 
 type AllCryptKeys map[chat1.ConversationMembersType][]CryptKey
@@ -42,15 +53,15 @@ type NameInfoSource interface {
 	LookupName(ctx context.Context, tlfID chat1.TLFID, public bool) (NameInfo, error)
 	AllCryptKeys(ctx context.Context, name string, public bool) (AllCryptKeys, error)
 	EncryptionKey(ctx context.Context, tlfName string, tlfID chat1.TLFID,
-		membersType chat1.ConversationMembersType, public bool) (CryptKey, NameInfo, error)
+		membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID) (CryptKey, NameInfo, error)
 	DecryptionKey(ctx context.Context, tlfName string, tlfID chat1.TLFID,
 		membersType chat1.ConversationMembersType, public bool,
-		keyGeneration int, kbfsEncrypted bool) (CryptKey, error)
+		keyGeneration int, kbfsEncrypted bool, botUID *gregor1.UID) (CryptKey, error)
 	EphemeralEncryptionKey(mctx libkb.MetaContext, tlfName string, tlfID chat1.TLFID,
-		membersType chat1.ConversationMembersType, public bool) (keybase1.TeamEk, error)
+		membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID) (EphemeralCryptKey, error)
 	EphemeralDecryptionKey(mctx libkb.MetaContext, tlfName string, tlfID chat1.TLFID,
-		membersType chat1.ConversationMembersType, public bool,
-		generation keybase1.EkGeneration, contentCtime *gregor1.Time) (keybase1.TeamEk, error)
+		membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID,
+		generation keybase1.EkGeneration, contentCtime *gregor1.Time) (EphemeralCryptKey, error)
 	ShouldPairwiseMAC(ctx context.Context, tlfName string, tlfID chat1.TLFID,
 		membersType chat1.ConversationMembersType, public bool) (bool, []keybase1.KID, error)
 }
@@ -84,7 +95,6 @@ type ConversationSource interface {
 		msgs []chat1.MessageBoxed) ([]chat1.MessageUnboxed, error)
 	GetUnreadline(ctx context.Context, convID chat1.ConversationID, uid gregor1.UID,
 		readMsgID chat1.MessageID) (*chat1.MessageID, error)
-	MarkAsRead(ctx context.Context, convID chat1.ConversationID, uid gregor1.UID, msgID chat1.MessageID) error
 	Clear(ctx context.Context, convID chat1.ConversationID, uid gregor1.UID) error
 	TransformSupersedes(ctx context.Context, unboxInfo UnboxConversationInfo, uid gregor1.UID,
 		msgs []chat1.MessageUnboxed) ([]chat1.MessageUnboxed, error)
@@ -113,11 +123,13 @@ type MessageDeliverer interface {
 
 type RegexpSearcher interface {
 	Search(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
-		re *regexp.Regexp, uiCh chan chat1.ChatSearchHit, opts chat1.SearchOpts) ([]chat1.ChatSearchHit, error)
+		re *regexp.Regexp, uiCh chan chat1.ChatSearchHit, opts chat1.SearchOpts) ([]chat1.ChatSearchHit, []chat1.MessageUnboxed, error)
 }
 
 type Indexer interface {
 	Resumable
+	Suspendable
+	BackgroundRunnable
 
 	Search(ctx context.Context, uid gregor1.UID, query, origQuery string, opts chat1.SearchOpts,
 		hitUICh chan chat1.ChatSearchInboxHit, indexUICh chan chat1.ChatSearchIndexStatus) (*chat1.ChatSearchInboxResults, error)
@@ -138,13 +150,14 @@ type Sender interface {
 		clientPrev chat1.MessageID, outboxID *chat1.OutboxID,
 		sendOpts *chat1.SenderSendOptions, prepareOpts *chat1.SenderPrepareOptions) (chat1.OutboxID, *chat1.MessageBoxed, error)
 	Prepare(ctx context.Context, msg chat1.MessagePlaintext, membersType chat1.ConversationMembersType,
-		conv *chat1.Conversation, opts *chat1.SenderPrepareOptions) (SenderPrepareResult, error)
+		conv *chat1.ConversationLocal, opts *chat1.SenderPrepareOptions) (SenderPrepareResult, error)
 }
 
 type InboxSource interface {
 	Offlinable
 	Resumable
 	Suspendable
+	badges.LocalChatState
 
 	Clear(ctx context.Context, uid gregor1.UID) error
 	Read(ctx context.Context, uid gregor1.UID, localizeTyp ConversationLocalizerTyp,
@@ -157,10 +170,12 @@ type InboxSource interface {
 	RemoteSetConversationStatus(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
 		status chat1.ConversationStatus) error
 	Search(ctx context.Context, uid gregor1.UID, query string, limit int) ([]RemoteConversation, error)
+	MarkAsRead(ctx context.Context, convID chat1.ConversationID, uid gregor1.UID, msgID chat1.MessageID) error
 
 	NewConversation(ctx context.Context, uid gregor1.UID, vers chat1.InboxVers,
 		conv chat1.Conversation) error
 	IsMember(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID) (bool, error)
+	IsTeam(ctx context.Context, uid gregor1.UID, item string) (bool, error)
 	NewMessage(ctx context.Context, uid gregor1.UID, vers chat1.InboxVers, convID chat1.ConversationID,
 		msg chat1.MessageBoxed, maxMsgs []chat1.MessageSummary) (*chat1.ConversationLocal, error)
 	ReadMessage(ctx context.Context, uid gregor1.UID, vers chat1.InboxVers, convID chat1.ConversationID,
@@ -239,6 +254,7 @@ type FetchRetrier interface {
 type ConvLoader interface {
 	Resumable
 	Suspendable
+	BackgroundRunnable
 
 	Queue(ctx context.Context, job ConvLoaderJob) error
 }
@@ -318,15 +334,15 @@ type IdentifyNotifier interface {
 
 type KeyFinder interface {
 	FindForEncryption(ctx context.Context, tlfName string, teamID chat1.TLFID,
-		membersType chat1.ConversationMembersType, public bool) (CryptKey, NameInfo, error)
+		membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID) (CryptKey, NameInfo, error)
 	FindForDecryption(ctx context.Context, tlfName string, teamID chat1.TLFID,
 		membersType chat1.ConversationMembersType, public bool, keyGeneration int,
-		kbfsEncrypted bool) (CryptKey, error)
+		kbfsEncrypted bool, botUID *gregor1.UID) (CryptKey, error)
 	EphemeralKeyForEncryption(mctx libkb.MetaContext, tlfName string, teamID chat1.TLFID,
-		membersType chat1.ConversationMembersType, public bool) (keybase1.TeamEk, error)
+		membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID) (EphemeralCryptKey, error)
 	EphemeralKeyForDecryption(mctx libkb.MetaContext, tlfName string, teamID chat1.TLFID,
-		membersType chat1.ConversationMembersType, public bool,
-		generation keybase1.EkGeneration, contentCtime *gregor1.Time) (keybase1.TeamEk, error)
+		membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID,
+		generation keybase1.EkGeneration, contentCtime *gregor1.Time) (EphemeralCryptKey, error)
 	ShouldPairwiseMAC(ctx context.Context, tlfName string, teamID chat1.TLFID,
 		membersType chat1.ConversationMembersType, public bool) (bool, []keybase1.KID, error)
 	Reset()
@@ -354,6 +370,7 @@ type AttachmentFetcher interface {
 	PutUploadedAsset(ctx context.Context, filename string, asset chat1.Asset) error
 	IsAssetLocal(ctx context.Context, asset chat1.Asset) (bool, error)
 	OnDbNuke(mctx libkb.MetaContext) error
+	OnStart(mctx libkb.MetaContext)
 }
 
 type AttachmentURLSrv interface {
@@ -475,7 +492,7 @@ type CoinFlipManager interface {
 	MaybeInjectFlipMessage(ctx context.Context, boxedMsg chat1.MessageBoxed, inboxVers chat1.InboxVers,
 		uid gregor1.UID, convID chat1.ConversationID, topicType chat1.TopicType) bool
 	LoadFlip(ctx context.Context, uid gregor1.UID, hostConvID chat1.ConversationID, hostMsgID chat1.MessageID,
-		flipConvID chat1.ConversationID, gameID chat1.FlipGameID)
+		flipConvID chat1.ConversationID, gameID chat1.FlipGameID) (chan chat1.UICoinFlipStatus, chan error)
 	DescribeFlipText(ctx context.Context, text string) string
 	HasActiveGames(ctx context.Context) bool
 	IsFlipConversationCreated(ctx context.Context, outboxID chat1.OutboxID) (chat1.ConversationID, FlipSendStatus)
@@ -483,7 +500,36 @@ type CoinFlipManager interface {
 
 type TeamMentionLoader interface {
 	Resumable
-	LoadTeamMention(ctx context.Context, uid gregor1.UID, teamName, channel string) error
+	LoadTeamMention(ctx context.Context, uid gregor1.UID,
+		maybeMention chat1.MaybeMention, knownTeamMentions []chat1.KnownTeamMention,
+		forceRemote bool) error
+	IsTeamMention(ctx context.Context, uid gregor1.UID,
+		maybeMention chat1.MaybeMention, knownTeamMentions []chat1.KnownTeamMention) bool
+}
+
+type ExternalAPIKeySource interface {
+	GetKey(ctx context.Context, typ chat1.ExternalAPIKeyTyp) (chat1.ExternalAPIKey, error)
+	GetAllKeys(ctx context.Context) ([]chat1.ExternalAPIKey, error)
+}
+
+type LiveLocationKey string
+
+type LiveLocationTracker interface {
+	Resumable
+	GetCurrentPosition(ctx context.Context, convID chat1.ConversationID, msgID chat1.MessageID)
+	StartTracking(ctx context.Context, convID chat1.ConversationID, msgID chat1.MessageID, endTime time.Time)
+	LocationUpdate(ctx context.Context, coord chat1.Coordinate)
+	GetCoordinates(ctx context.Context, key LiveLocationKey) []chat1.Coordinate
+	ActivelyTracking(ctx context.Context) bool
+	StopAllTracking(ctx context.Context)
+}
+
+type BotCommandManager interface {
+	Resumable
+	Advertise(ctx context.Context, alias *string, ads []chat1.AdvertiseCommandsParam) error
+	Clear(ctx context.Context) error
+	ListCommands(ctx context.Context, convID chat1.ConversationID) ([]chat1.UserBotCommandOutput, error)
+	UpdateCommands(ctx context.Context, convID chat1.ConversationID, info *chat1.BotInfo) (chan error, error)
 }
 
 type InternalError interface {

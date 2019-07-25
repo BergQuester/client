@@ -36,7 +36,7 @@ func TestRotate(t *testing.T) {
 	require.Equal(t, len(keys1), 1)
 	require.Equal(t, keys1[0].KeyGeneration, keybase1.PerTeamKeyGeneration(1))
 
-	if err := team.Rotate(context.TODO()); err != nil {
+	if err := team.Rotate(context.TODO(), keybase1.RotationType_VISIBLE); err != nil {
 		t.Fatal(err)
 	}
 
@@ -60,6 +60,47 @@ func TestRotate(t *testing.T) {
 	require.Equal(t, len(keys2), 2)
 	require.Equal(t, keys2[0].KeyGeneration, keybase1.PerTeamKeyGeneration(1))
 	require.Equal(t, keys1[0].Key, keys2[0].Key)
+}
+
+func TestRotateWithRestrictedBot(t *testing.T) {
+	tc, owner, other, _, name := memberSetupMultiple(t)
+	defer tc.Cleanup()
+
+	err := SetRoleRestrictedBot(context.TODO(), tc.G, name, other.Username)
+	require.NoError(t, err)
+
+	tc.G.Logout(context.TODO())
+	require.NoError(t, other.Login(tc.G))
+	team, err := GetForTestByStringName(context.TODO(), tc.G, name)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, team.Generation())
+	require.Zero(t, len(team.Data.PerTeamKeySeedsUnverified))
+	_, err = team.AllApplicationKeys(context.TODO(), keybase1.TeamApplication_CHAT)
+	require.IsType(t, libkb.NotFoundError{}, err)
+
+	// Restricted bots cannot rotate
+	err = team.Rotate(context.TODO(), keybase1.RotationType_VISIBLE)
+	require.IsType(t, libkb.NotFoundError{}, err)
+
+	tc.G.Logout(context.TODO())
+	require.NoError(t, owner.Login(tc.G))
+	team, err = GetForTestByStringName(context.TODO(), tc.G, name)
+	require.NoError(t, err)
+	err = team.Rotate(context.TODO(), keybase1.RotationType_VISIBLE)
+	require.NoError(t, err)
+
+	tc.G.Logout(context.TODO())
+	require.NoError(t, other.Login(tc.G))
+	after, err := GetForTestByStringName(context.TODO(), tc.G, name)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, after.Generation())
+	require.Zero(t, len(after.Data.PerTeamKeySeedsUnverified))
+
+	assertRole(tc, name, owner.Username, keybase1.TeamRole_OWNER)
+	assertRole(tc, name, other.Username, keybase1.TeamRole_RESTRICTEDBOT)
+
+	_, err = after.AllApplicationKeys(context.TODO(), keybase1.TeamApplication_CHAT)
+	require.IsType(t, libkb.NotFoundError{}, err)
 }
 
 func setupRotateTest(t *testing.T, implicit bool, public bool) (tc libkb.TestContext, owner, other *kbtest.FakeUser, teamID keybase1.TeamID, teamName keybase1.TeamName) {
@@ -108,7 +149,7 @@ func TestHandleRotateRequestOldGeneration(t *testing.T) {
 		require.NoError(t, err)
 
 		// rotate to bump the generation
-		err = team.Rotate(context.TODO())
+		err = team.Rotate(context.TODO(), keybase1.RotationType_VISIBLE)
 		require.NoError(t, err)
 
 		team, err = GetForTestByID(context.TODO(), tc.G, teamID)
@@ -263,7 +304,7 @@ func TestRotateRace(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 10; i++ {
 		t.Logf("round %v", i)
 
 		errCh1 := rotate(0)

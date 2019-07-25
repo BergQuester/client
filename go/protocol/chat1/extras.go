@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"hash"
@@ -66,6 +67,10 @@ func (cid ConversationID) String() string {
 	return hex.EncodeToString(cid)
 }
 
+func (cid ConversationID) Bytes() []byte {
+	return []byte(cid)
+}
+
 func (cid ConversationID) IsNil() bool {
 	return len(cid) < DbShortFormLen
 }
@@ -83,7 +88,11 @@ const DbShortFormLen = 10
 // DbShortForm should only be used when interacting with the database, and should
 // never leave Gregor
 func (cid ConversationID) DbShortForm() ConvIDShort {
-	return cid[:DbShortFormLen]
+	end := DbShortFormLen
+	if end > len(cid) {
+		end = len(cid)
+	}
+	return cid[:end]
 }
 
 func (cid ConversationID) DbShortFormString() string {
@@ -462,6 +471,13 @@ func (m MessageUnboxed) AtMentionUsernames() []string {
 		return nil
 	}
 	return m.Valid().AtMentionUsernames
+}
+
+func (m MessageUnboxed) ChannelMention() ChannelMention {
+	if !m.IsValid() {
+		return ChannelMention_NONE
+	}
+	return m.Valid().ChannelMention
 }
 
 func (m *MessageUnboxed) DebugString() string {
@@ -1467,10 +1483,6 @@ func (r *DeleteConversationLocalRes) SetOffline() {
 	r.Offline = true
 }
 
-func (r *GetInboxUILocalRes) SetOffline() {
-	r.Offline = true
-}
-
 func (r *SearchRegexpRes) SetOffline() {
 	r.Offline = true
 }
@@ -1705,6 +1717,14 @@ func (r *GetInboxAndUnboxLocalRes) GetRateLimit() []RateLimit {
 }
 
 func (r *GetInboxAndUnboxLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *LoadFlipRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *LoadFlipRes) SetRateLimits(rl []RateLimit) {
 	r.RateLimits = rl
 }
 
@@ -2036,11 +2056,35 @@ func (r *SetRetentionRes) SetRateLimits(rl []RateLimit) {
 	r.RateLimit = &rl[0]
 }
 
-func (r *GetInboxUILocalRes) GetRateLimit() (res []RateLimit) {
+func (r *LoadGalleryRes) GetRateLimit() []RateLimit {
 	return r.RateLimits
 }
 
-func (r *GetInboxUILocalRes) SetRateLimits(rl []RateLimit) {
+func (r *LoadGalleryRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *ListBotCommandsLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *ListBotCommandsLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *ClearBotCommandsLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *ClearBotCommandsLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *AdvertiseBotCommandsLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *AdvertiseBotCommandsLocalRes) SetRateLimits(rl []RateLimit) {
 	r.RateLimits = rl
 }
 
@@ -2073,11 +2117,11 @@ func (i *ConversationMinWriterRoleInfoLocal) String() string {
 	if i == nil {
 		return "Minimum writer role for this conversation is not set."
 	}
-	usernameSuffix := "."
-	if i.Username != "" {
-		usernameSuffix = fmt.Sprintf(", last set by %v.", i.Username)
+	changedBySuffix := "."
+	if i.ChangedBy != "" {
+		changedBySuffix = fmt.Sprintf(", last set by %v.", i.ChangedBy)
 	}
-	return fmt.Sprintf("Minimum writer role for this conversation is %v%v", i.Role, usernameSuffix)
+	return fmt.Sprintf("Minimum writer role for this conversation is %v%v", i.Role, changedBySuffix)
 }
 
 func (s *ConversationSettings) IsNil() bool {
@@ -2094,7 +2138,14 @@ func (o SearchOpts) Matches(msg MessageUnboxed) bool {
 	if o.SentBy != "" && msg.SenderUsername() != o.SentBy {
 		return false
 	}
+	// Check if the user was @mentioned or there was a @here/@channel.
 	if o.SentTo != "" {
+		if o.MatchMentions {
+			switch msg.ChannelMention() {
+			case ChannelMention_ALL, ChannelMention_HERE:
+				return true
+			}
+		}
 		for _, username := range msg.AtMentionUsernames() {
 			if o.SentTo == username {
 				return true
@@ -2146,7 +2197,9 @@ func (u UnfurlRaw) GetUrl() string {
 	case UnfurlType_GENERIC:
 		return u.Generic().Url
 	case UnfurlType_GIPHY:
-		return u.Giphy().ImageUrl
+		if u.Giphy().ImageUrl != nil {
+			return *u.Giphy().ImageUrl
+		}
 	}
 	return ""
 }
@@ -2194,7 +2247,7 @@ func (g UnfurlGiphyRaw) UnsafeDebugString() string {
 	return fmt.Sprintf(`GIPHY SPECIAL
 FaviconUrl: %s
 ImageUrl: %s
-Video: %s`, yieldStr(g.FaviconUrl), g.ImageUrl, g.Video)
+Video: %s`, yieldStr(g.FaviconUrl), yieldStr(g.ImageUrl), g.Video)
 }
 
 func (v UnfurlVideo) String() string {
@@ -2226,6 +2279,8 @@ func (g GlobalAppNotificationSetting) Usage() string {
 	switch g {
 	case GlobalAppNotificationSetting_NEWMESSAGES:
 		return "Show notifications for new messages"
+	case GlobalAppNotificationSetting_PLAINTEXTDESKTOP:
+		return "Show plaintext notifications on desktop devices"
 	case GlobalAppNotificationSetting_PLAINTEXTMOBILE:
 		return "Show plaintext notifications on mobile devices"
 	case GlobalAppNotificationSetting_DEFAULTSOUNDMOBILE:
@@ -2241,6 +2296,8 @@ func (g GlobalAppNotificationSetting) FlagName() string {
 	switch g {
 	case GlobalAppNotificationSetting_NEWMESSAGES:
 		return "new-messages"
+	case GlobalAppNotificationSetting_PLAINTEXTDESKTOP:
+		return "plaintext-desktop"
 	case GlobalAppNotificationSetting_PLAINTEXTMOBILE:
 		return "plaintext-mobile"
 	case GlobalAppNotificationSetting_DEFAULTSOUNDMOBILE:
@@ -2349,4 +2406,70 @@ func (o *SenderSendOptions) GetJoinMentionsAs() *ConversationMemberStatus {
 		return nil
 	}
 	return o.JoinMentionsAs
+}
+
+func (c Coordinate) IsZero() bool {
+	return c.Lat == 0 && c.Lon == 0
+}
+
+func (c Coordinate) Eq(o Coordinate) bool {
+	return c.Lat == o.Lat && c.Lon == o.Lon
+}
+
+func (b BotInfo) Hash() BotInfoHash {
+	hash := sha256Pool.Get().(hash.Hash)
+	defer sha256Pool.Put(hash)
+	hash.Reset()
+	sort.Slice(b.CommandConvs, func(i, j int) bool {
+		ikey := b.CommandConvs[i].Uid.String() + b.CommandConvs[i].ConvID.String()
+		jkey := b.CommandConvs[j].Uid.String() + b.CommandConvs[j].ConvID.String()
+		return ikey < jkey
+	})
+	for _, cconv := range b.CommandConvs {
+		hash.Write(cconv.ConvID)
+		hash.Write(cconv.Uid)
+		hash.Write([]byte(strconv.FormatUint(uint64(cconv.Vers), 10)))
+	}
+	return BotInfoHash(hash.Sum(nil))
+}
+
+func (b BotInfoHash) Eq(h BotInfoHash) bool {
+	return bytes.Equal(b, h)
+}
+
+func (p AdvertiseCommandsParam) ToRemote(convID ConversationID, tlfID *TLFID) (res RemoteBotCommandsAdvertisement, err error) {
+	switch p.Typ {
+	case BotCommandsAdvertisementTyp_PUBLIC:
+		return NewRemoteBotCommandsAdvertisementWithPublic(RemoteBotCommandsAdvertisementPublic{
+			ConvID: convID,
+		}), nil
+	case BotCommandsAdvertisementTyp_TLFID_CONVS:
+		if tlfID == nil {
+			return res, errors.New("no TLFID specified")
+		}
+		return NewRemoteBotCommandsAdvertisementWithTlfidConvs(RemoteBotCommandsAdvertisementTLFID{
+			ConvID: convID,
+			TlfID:  *tlfID,
+		}), nil
+	case BotCommandsAdvertisementTyp_TLFID_MEMBERS:
+		if tlfID == nil {
+			return res, errors.New("no TLFID specified")
+		}
+		return NewRemoteBotCommandsAdvertisementWithTlfidMembers(RemoteBotCommandsAdvertisementTLFID{
+			ConvID: convID,
+			TlfID:  *tlfID,
+		}), nil
+	default:
+		return res, errors.New("unknown bot advertisement typ")
+	}
+}
+
+func (c UserBotCommandInput) ToOutput(username string) UserBotCommandOutput {
+	return UserBotCommandOutput{
+		Name:                c.Name,
+		Description:         c.Description,
+		Usage:               c.Usage,
+		ExtendedDescription: c.ExtendedDescription,
+		Username:            username,
+	}
 }

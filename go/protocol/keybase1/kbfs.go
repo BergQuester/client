@@ -48,6 +48,20 @@ type FSOnlineStatusChangedEventArg struct {
 	Online bool `codec:"online" json:"online"`
 }
 
+type FSFavoritesChangedEventArg struct {
+}
+
+type FSSubscriptionNotifyPathEventArg struct {
+	SubscriptionID string                `codec:"subscriptionID" json:"subscriptionID"`
+	Path           string                `codec:"path" json:"path"`
+	Topic          PathSubscriptionTopic `codec:"topic" json:"topic"`
+}
+
+type FSSubscriptionNotifyEventArg struct {
+	SubscriptionID string            `codec:"subscriptionID" json:"subscriptionID"`
+	Topic          SubscriptionTopic `codec:"topic" json:"topic"`
+}
+
 type CreateTLFArg struct {
 	TeamID TeamID `codec:"teamID" json:"teamID"`
 	TlfID  TLFID  `codec:"tlfID" json:"tlfID"`
@@ -98,6 +112,10 @@ type KbfsInterface interface {
 	FSOverallSyncEvent(context.Context, FolderSyncStatus) error
 	// FSOnlineStatusChangedEvent is called by KBFS when the online status changes.
 	FSOnlineStatusChangedEvent(context.Context, bool) error
+	// FSFavoritesChangedEvent is called by KBFS when the favorites list changes.
+	FSFavoritesChangedEvent(context.Context) error
+	FSSubscriptionNotifyPathEvent(context.Context, FSSubscriptionNotifyPathEventArg) error
+	FSSubscriptionNotifyEvent(context.Context, FSSubscriptionNotifyEventArg) error
 	// createTLF is called by KBFS to associate the tlfID with the given teamID,
 	// using the v2 Team-based system.
 	CreateTLF(context.Context, CreateTLFArg) error
@@ -217,6 +235,46 @@ func KbfsProtocol(i KbfsInterface) rpc.Protocol {
 						return
 					}
 					err = i.FSOnlineStatusChangedEvent(ctx, typedArgs[0].Online)
+					return
+				},
+			},
+			"FSFavoritesChangedEvent": {
+				MakeArg: func() interface{} {
+					var ret [1]FSFavoritesChangedEventArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					err = i.FSFavoritesChangedEvent(ctx)
+					return
+				},
+			},
+			"FSSubscriptionNotifyPathEvent": {
+				MakeArg: func() interface{} {
+					var ret [1]FSSubscriptionNotifyPathEventArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]FSSubscriptionNotifyPathEventArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]FSSubscriptionNotifyPathEventArg)(nil), args)
+						return
+					}
+					err = i.FSSubscriptionNotifyPathEvent(ctx, typedArgs[0])
+					return
+				},
+			},
+			"FSSubscriptionNotifyEvent": {
+				MakeArg: func() interface{} {
+					var ret [1]FSSubscriptionNotifyEventArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]FSSubscriptionNotifyEventArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]FSSubscriptionNotifyEventArg)(nil), args)
+						return
+					}
+					err = i.FSSubscriptionNotifyEvent(ctx, typedArgs[0])
 					return
 				},
 			},
@@ -359,6 +417,22 @@ func (c KbfsClient) FSOverallSyncEvent(ctx context.Context, status FolderSyncSta
 func (c KbfsClient) FSOnlineStatusChangedEvent(ctx context.Context, online bool) (err error) {
 	__arg := FSOnlineStatusChangedEventArg{Online: online}
 	err = c.Cli.Call(ctx, "keybase.1.kbfs.FSOnlineStatusChangedEvent", []interface{}{__arg}, nil)
+	return
+}
+
+// FSFavoritesChangedEvent is called by KBFS when the favorites list changes.
+func (c KbfsClient) FSFavoritesChangedEvent(ctx context.Context) (err error) {
+	err = c.Cli.Call(ctx, "keybase.1.kbfs.FSFavoritesChangedEvent", []interface{}{FSFavoritesChangedEventArg{}}, nil)
+	return
+}
+
+func (c KbfsClient) FSSubscriptionNotifyPathEvent(ctx context.Context, __arg FSSubscriptionNotifyPathEventArg) (err error) {
+	err = c.Cli.Call(ctx, "keybase.1.kbfs.FSSubscriptionNotifyPathEvent", []interface{}{__arg}, nil)
+	return
+}
+
+func (c KbfsClient) FSSubscriptionNotifyEvent(ctx context.Context, __arg FSSubscriptionNotifyEventArg) (err error) {
+	err = c.Cli.Call(ctx, "keybase.1.kbfs.FSSubscriptionNotifyEvent", []interface{}{__arg}, nil)
 	return
 }
 

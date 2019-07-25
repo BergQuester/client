@@ -27,10 +27,39 @@ protocol local {
     TextPaymentResult result;
   }
 
+
+  record KnownUserMention {
+    string text;
+    gregor1.UID uid;
+  }
+
+  record KnownTeamMention {
+    string name;
+    string channel;
+  }
+
+  record MaybeMention {
+    string name;
+    string channel;
+  }
+
+  record Coordinate {
+    double lat;
+    double lon;
+    double accuracy;
+  }
+
+  record LiveLocation {
+    gregor1.Time endTime;
+  }
+
   record MessageText {
     string body;
     array<TextPayment> payments;
     union { null, MessageID } replyTo;
+    array<KnownUserMention> userMentions;
+    array<KnownTeamMention> teamMentions;
+    union { null, LiveLocation } liveLocation;
   }
 
   record MessageConversationMetadata {
@@ -40,6 +69,8 @@ protocol local {
   record MessageEdit {
     MessageID messageID;
     string body;
+    array<KnownUserMention> userMentions;
+    array<KnownTeamMention> teamMentions;
   }
 
   record MessageDelete {
@@ -54,6 +85,8 @@ protocol local {
     string text;
     FlipGameID gameID;
     ConversationID flipConvID;
+    array<KnownUserMention> userMentions;
+    array<KnownTeamMention> teamMentions;
   }
 
   enum MessageSystemType {
@@ -75,6 +108,7 @@ protocol local {
     array<string> admins;
     array<string> writers;
     array<string> readers;
+    array<string> restrictedBots;
   }
 
   record MessageSystemInviteAddedToTeam {
@@ -305,6 +339,9 @@ protocol local {
     // This is the only difference between V2 and V3.
     @mpackkey("em") @jsonkey("em")
     union { null, MsgEphemeralMetadata } ephemeralMetadata;
+
+    @mpackkey("b") @jsonkey("b")
+    union { null, gregor1.UID } botUID;
   }
 
   // HeaderPlaintext is a variant container for all the
@@ -372,11 +409,6 @@ protocol local {
     union { null, OutboxID } supersedesOutboxID;
   }
 
-  record MaybeTeamMention {
-    string name;
-    string channel;
-  }
-
   record MessageUnboxedValid {
     MessageClientHeaderVerified clientHeader;
     MessageServerHeader serverHeader;
@@ -411,7 +443,7 @@ protocol local {
     array<string> atMentionUsernames;
     array<gregor1.UID> atMentions;
     ChannelMention channelMention;
-    array<MaybeTeamMention> teamMentions;
+    array<MaybeMention> maybeMentions;
     array<ChannelNameMention> channelNameMentions;
     // reactionText -> [Reaction(username, reactionMsgID)...]
     ReactionMap reactions;
@@ -483,6 +515,7 @@ protocol local {
   record ConversationLocalParticipant {
     string username;
     union { null, string } fullname;
+    union { null, string } contactName;
   }
 
   record ConversationInfoLocal {
@@ -542,7 +575,8 @@ protocol local {
   }
 
   record ConversationMinWriterRoleInfoLocal {
-    string username;
+    string changedBy;
+    boolean cannotWrite;
     keybase1.TeamRole role;
   }
 
@@ -576,7 +610,9 @@ protocol local {
     union { null, RetentionPolicy } teamRetention;
     union { null, ConversationSettingsLocal } convSettings;
 
+    // Commands for auto complete and bot comm
     ConversationCommandGroups commands;
+    ConversationCommandGroups botCommands;
   }
 
   record NonblockFetchRes {
@@ -645,21 +681,6 @@ protocol local {
   }
   UnreadlineRes getUnreadline(int sessionID, ConversationID convID,
     MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);
-
-
-  record GetInboxUILocalRes {
-    array<UnverifiedInboxUIItem> conversationsRemote;
-    union { null, Pagination } pagination;
-
-    boolean offline;
-    array<RateLimit> rateLimits;
-    // This only contains identify failures if a TLF name is specified in arg.
-    // It doesn't contain identifyFailures otherwise, since GetInboxLocal
-    // doesn't run identify for each conversation in the inbox.
-    // GetInboxAndUnboxLocal should be used if identify failures are needed.
-    array<keybase1.TLFIdentifyFailure> identifyFailures;
-  }
-  GetInboxUILocalRes getInboxUILocal(union { null, GetInboxLocalQuery} query, union { null, Pagination } pagination, keybase1.TLFIdentifyBehavior identifyBehavior);
 
   record NameQuery {
     string name;
@@ -1009,6 +1030,7 @@ protocol local {
   map<string, ProfileSearchConvStats> profileChatSearch(keybase1.TLFIdentifyBehavior identifyBehavior);
 
   // Static data that changes only as often as the code.
+  // TODO: consolidate this RPC with the wallet `getStaticConfig` in the future
   StaticConfig getStaticConfig();
   record BuiltinCommandGroup {
     ConversationBuiltinCommandTyp typ;
@@ -1043,4 +1065,75 @@ protocol local {
   void bulkAddToConv(ConversationID convID, array<string> usernames);
 
   keybase1.UserReacjis putReacjiSkinTone(keybase1.ReacjiSkinTone skinTone);
+
+  void resolveMaybeMention(MaybeMention mention);
+
+  // Gallery support
+  enum GalleryItemTyp {
+    MEDIA_0,
+    LINK_1,
+    DOC_2
+  }
+  record LoadGalleryRes {
+    array<UIMessage> messages;
+    boolean last;
+    array<RateLimit> rateLimits;
+    array<keybase1.TLFIdentifyFailure> identifyFailures;
+  }
+  LoadGalleryRes loadGallery(int sessionID, ConversationID convID, GalleryItemTyp typ, int num, union { null, MessageID } fromMsgID);
+
+  // Flips in the API
+  record LoadFlipRes {
+    UICoinFlipStatus status;
+    array<RateLimit> rateLimits;
+    array<keybase1.TLFIdentifyFailure> identifyFailures;
+  }
+  LoadFlipRes loadFlip(ConversationID hostConvID, MessageID hostMsgID, ConversationID flipConvID, FlipGameID gameID);
+
+  // Location updates
+  void locationUpdate(Coordinate coord);
+  void locationDenied(ConversationID convID);
+
+  // Bot commands
+  record UserBotExtendedDescription {
+    string title;
+    @jsonkey("desktop_body")
+    string desktopBody;
+    @jsonkey("mobile_body")
+    string mobileBody;
+  }
+  record UserBotCommandOutput {
+    string name;
+    string description;
+    string usage;
+    @jsonkey("extended_description")
+    union { null, UserBotExtendedDescription } extendedDescription;
+    string username;
+  }
+  record UserBotCommandInput {
+    string name;
+    string description;
+    string usage;
+    @jsonkey("extended_description")
+    union { null, UserBotExtendedDescription } extendedDescription;
+  }
+  record AdvertiseCommandsParam {
+    BotCommandsAdvertisementTyp typ;
+    array<UserBotCommandInput> commands;
+    union { null, string } teamName;
+  }
+  record AdvertiseBotCommandsLocalRes {
+    array<RateLimit> rateLimits;
+  }
+  AdvertiseBotCommandsLocalRes advertiseBotCommandsLocal(union { null, string } alias,
+    array<AdvertiseCommandsParam> advertisements);
+  record ListBotCommandsLocalRes {
+    array<UserBotCommandOutput> commands;
+    array<RateLimit> rateLimits;
+  }
+  ListBotCommandsLocalRes listBotCommandsLocal(ConversationID convID);
+  record ClearBotCommandsLocalRes {
+    array<RateLimit> rateLimits;
+  }
+  ClearBotCommandsLocalRes clearBotCommandsLocal();
 }

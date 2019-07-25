@@ -16,8 +16,16 @@
           "name": "username"
         },
         {
+          "type": "FullName",
+          "name": "fullname"
+        },
+        {
           "type": "boolean",
           "name": "hasStoredSecret"
+        },
+        {
+          "type": "boolean",
+          "name": "isCurrent"
         }
       ]
     }
@@ -94,6 +102,10 @@
         {
           "name": "sessionID",
           "type": "int"
+        },
+        {
+          "name": "username",
+          "type": "string"
         }
       ],
       "response": null,
@@ -147,6 +159,20 @@
         }
       ],
       "response": null
+    },
+    "recoverPassphrase": {
+      "request": [
+        {
+          "name": "sessionID",
+          "type": "int"
+        },
+        {
+          "name": "username",
+          "type": "string"
+        }
+      ],
+      "response": null,
+      "doc": "Guide the user through possibilities of changing their passphrase.\n    Lets them change their passphrase using a paper key or enter the reset pipeline."
     },
     "paperKey": {
       "request": [
@@ -222,6 +248,11 @@
       ],
       "response": null,
       "doc": "loginOneshot allows a service to have a \"onetime login\", without\n   provisioning a device. It bootstraps credentials with the given\n   paperkey"
+    },
+    "isOnline": {
+      "request": [],
+      "response": "bool",
+      "doc": "isOnline returns whether the device is able to open a connection to keybase.io.\n   Used for determining whether to offer proxy settings on the login screen."
     }
   },
   "namespace": "keybase.1"

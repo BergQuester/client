@@ -201,6 +201,9 @@ func (l *LevelDb) doWhileOpenAndNukeIfCorrupted(action func() error) (err error)
 	// If the file is corrupt, just nuke and act like we didn't find anything
 	if l.nukeIfCorrupt(err) {
 		err = nil
+	} else if IsNoSpaceOnDeviceError(err) {
+		// If we are out of space force a db clean
+		go l.cleaner.clean(true)
 	}
 
 	// Notably missing here is the error handling for when DB open fails but on
@@ -237,6 +240,16 @@ func (l *LevelDb) Stats() (stats string) {
 		return ""
 	}
 	return stats
+}
+
+func (l *LevelDb) CompactionStats() (memActive, tableActive bool, err error) {
+	var dbStats leveldb.DBStats
+	if err := l.doWhileOpenAndNukeIfCorrupted(func() (err error) {
+		return l.db.Stats(&dbStats)
+	}); err != nil {
+		return false, false, err
+	}
+	return dbStats.MemCompactionActive, dbStats.TableCompactionActive, nil
 }
 
 func (l *LevelDb) GetFilename() string {

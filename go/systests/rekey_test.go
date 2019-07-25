@@ -20,16 +20,16 @@ import (
 // deviceWrapper wraps a mock "device", meaning an independent running service and
 // some connected clients.
 type deviceWrapper struct {
-	tctx          *libkb.TestContext
-	clones        []*libkb.TestContext
-	stopCh        chan error
-	service       *service.Service
-	rekeyUI       *testRekeyUI
-	deviceKey     keybase1.PublicKey
-	rekeyClient   keybase1.RekeyClient
-	userClient    keybase1.UserClient
-	accountClient keybase1.AccountClient
-	gregorClient  keybase1.GregorClient
+	tctx               *libkb.TestContext
+	clones, usedClones []*libkb.TestContext
+	stopCh             chan error
+	service            *service.Service
+	rekeyUI            *testRekeyUI
+	deviceKey          keybase1.PublicKey
+	rekeyClient        keybase1.RekeyClient
+	userClient         keybase1.UserClient
+	accountClient      keybase1.AccountClient
+	gregorClient       keybase1.GregorClient
 }
 
 func (d *deviceWrapper) KID() keybase1.KID {
@@ -59,6 +59,8 @@ func (d *deviceWrapper) popClone() *libkb.TestContext {
 		panic("ran out of cloned environments")
 	}
 	ret := d.clones[0]
+	// Hold a reference to this clone for cleanup
+	d.usedClones = append(d.usedClones, ret)
 	d.clones = d.clones[1:]
 	return ret
 }
@@ -153,6 +155,12 @@ func (rkt *rekeyTester) cleanup() {
 		if od.service != nil {
 			od.service.Stop(0)
 			od.stop()
+		}
+		for _, cl := range od.clones {
+			cl.Cleanup()
+		}
+		for _, cl := range od.usedClones {
+			cl.Cleanup()
 		}
 	}
 }
@@ -530,6 +538,14 @@ func (u *rekeyBackupKeyUI) DisplayResetProgress(_ context.Context, arg keybase1.
 	return nil
 }
 
+func (u *rekeyBackupKeyUI) ExplainDeviceRecovery(_ context.Context, arg keybase1.ExplainDeviceRecoveryArg) error {
+	return nil
+}
+
+func (u *rekeyBackupKeyUI) PromptPassphraseRecovery(_ context.Context, arg keybase1.PromptPassphraseRecoveryArg) (bool, error) {
+	return false, nil
+}
+
 func (rkt *rekeyTester) findNewBackupKey(newList []backupKey) (ret backupKey, found bool) {
 	for _, newBackup := range newList {
 		tmpFound := false
@@ -668,6 +684,12 @@ func (r *rekeyProvisionUI) PromptResetAccount(_ context.Context, arg keybase1.Pr
 }
 func (r *rekeyProvisionUI) DisplayResetProgress(_ context.Context, arg keybase1.DisplayResetProgressArg) error {
 	return nil
+}
+func (r *rekeyProvisionUI) ExplainDeviceRecovery(_ context.Context, arg keybase1.ExplainDeviceRecoveryArg) error {
+	return nil
+}
+func (r *rekeyProvisionUI) PromptPassphraseRecovery(_ context.Context, arg keybase1.PromptPassphraseRecoveryArg) (bool, error) {
+	return false, nil
 }
 
 func (rkt *rekeyTester) provisionNewDevice() *deviceWrapper {

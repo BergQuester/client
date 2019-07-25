@@ -72,11 +72,14 @@ func (p CommandLine) GetHome() string {
 func (p CommandLine) GetMobileSharedHome() string {
 	return p.GetGString("mobile-shared-home")
 }
-func (p CommandLine) GetServerURI() string {
-	return p.GetGString("server")
+func (p CommandLine) GetServerURI() (string, error) {
+	return p.GetGString("server"), nil
 }
 func (p CommandLine) GetConfigFilename() string {
 	return p.GetGString("config-file")
+}
+func (p CommandLine) GetGUIConfigFilename() string {
+	return p.GetGString("gui-config-file")
 }
 func (p CommandLine) GetUpdaterConfigFilename() string {
 	return p.GetGString("updater-config-file")
@@ -98,6 +101,9 @@ func (p CommandLine) GetPvlKitFilename() string {
 }
 func (p CommandLine) GetParamProofKitFilename() string {
 	return p.GetGString("paramproof-kit")
+}
+func (p CommandLine) GetExternalURLKitFilename() string {
+	return p.GetGString("externalurl-kit")
 }
 func (p CommandLine) GetProveBypass() (bool, bool) {
 	return p.GetBool("prove-bypass", true)
@@ -160,6 +166,10 @@ func (p CommandLine) GetGregorSaveInterval() (time.Duration, bool) {
 }
 func (p CommandLine) GetGregorDisabled() (bool, bool) {
 	return p.GetBool("push-disabled", true)
+}
+func (p CommandLine) GetSecretStorePrimingDisabled() (bool, bool) {
+	// SecretStorePrimingDisabled is only for tests
+	return false, false
 }
 func (p CommandLine) GetBGIdentifierDisabled() (bool, bool) {
 	return p.GetBool("bg-identifier-disabled", true)
@@ -373,6 +383,16 @@ func (p CommandLine) GetTorProxy() string {
 	return p.GetGString("tor-proxy")
 }
 
+func (p CommandLine) GetProxyType() string {
+	return p.GetGString("proxy-type")
+}
+
+func (p CommandLine) IsCertPinningEnabled() bool {
+	r1, _ := p.GetBool("disable-cert-pinning", true)
+	// Defaults to false since it is a boolean flag, so just invert it
+	return !r1
+}
+
 func (p CommandLine) GetMountDir() string {
 	return p.GetGString("mountdir")
 }
@@ -423,6 +443,10 @@ func (p CommandLine) GetForceLinuxKeyring() (bool, bool) {
 
 func (p CommandLine) GetForceSecretStoreFile() (bool, bool) {
 	return false, false // not configurable via command line flags
+}
+
+func (p CommandLine) GetRuntimeStatsEnabled() (bool, bool) {
+	return false, false
 }
 
 func (p CommandLine) GetAttachmentHTTPStartPort() (int, bool) {
@@ -537,6 +561,11 @@ func (p *CommandLine) PopulateApp(addHelp bool, extraFlags []cli.Flag) {
 			Usage: "Enable debugging mode.",
 		},
 		cli.BoolFlag{
+			Name: "disable-cert-pinning",
+			Usage: "Disable certificate pinning within the app. WARNING: This reduces the security of the app. Do not use " +
+				"unless necessary! This should only be used if you are running keybase behind a proxy that does TLS interception.",
+		},
+		cli.BoolFlag{
 			Name:  "display-raw-untrusted-output",
 			Usage: "Display output from users (messages, chats, ...) in the terminal without escaping terminal codes. WARNING: maliciously crafted unescaped outputs can overwrite anything you see on the terminal.",
 		},
@@ -606,7 +635,11 @@ func (p *CommandLine) PopulateApp(addHelp bool, extraFlags []cli.Flag) {
 		},
 		cli.StringFlag{
 			Name:  "proxy",
-			Usage: "Specify an HTTP(s) proxy to ship all Web requests over.",
+			Usage: "Specify a proxy to ship all Web requests over; Must be used with --proxy-type; Example: localhost:8080",
+		},
+		cli.StringFlag{
+			Name:  "proxy-type",
+			Usage: fmt.Sprintf("set the proxy type; One of: %s", libkb.GetCommaSeparatedListOfProxyTypes()),
 		},
 		cli.BoolFlag{
 			Name:  "push-disabled",
@@ -691,6 +724,10 @@ func (p *CommandLine) PopulateApp(addHelp bool, extraFlags []cli.Flag) {
 		cli.StringFlag{
 			Name:  "updater-config-file",
 			Usage: "Specify a path to the updater config file",
+		},
+		cli.StringFlag{
+			Name:  "gui-config-file",
+			Usage: "Specify a path to the GUI config file",
 		},
 		cli.BoolFlag{
 			Name:  "upgrade-per-user-key",

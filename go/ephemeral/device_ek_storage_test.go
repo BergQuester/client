@@ -84,7 +84,7 @@ func TestDeviceEKStorage(t *testing.T) {
 	require.Error(t, err)
 	require.IsType(t, EphemeralKeyError{}, err)
 	ekErr := err.(EphemeralKeyError)
-	expectedErr := newEKCorruptedErr(mctx, DeviceEKStr, corruptedGeneration, 100)
+	expectedErr := newEKCorruptedErr(mctx, DeviceEKKind, corruptedGeneration, 100)
 	require.Equal(t, expectedErr.Error(), ekErr.Error())
 	require.Equal(t, DefaultHumanErrMsg, ekErr.HumanError())
 
@@ -271,7 +271,7 @@ func TestDeviceEKStorageDeleteExpiredKeys(t *testing.T) {
 	expired := s.getExpiredGenerations(mctx, make(keyExpiryMap), now)
 	var expected []keybase1.EkGeneration
 	expected = nil
-	require.Equal(t, expected, expected)
+	require.Equal(t, expected, expired)
 
 	// Test with a single key that is not expired
 	keyMap := keyExpiryMap{

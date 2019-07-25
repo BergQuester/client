@@ -16,6 +16,8 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/client/go/sig3"
+	"github.com/keybase/client/go/teams/hidden"
 	jsonw "github.com/keybase/go-jsonw"
 )
 
@@ -62,10 +64,11 @@ func NewImplicitTeamName() (res keybase1.TeamName, err error) {
 	return res, err
 }
 
-func NewSubteamSig(g *libkb.GlobalContext, me libkb.UserForSignatures, key libkb.GenericKey, parentTeam *TeamSigChainState, subteamName keybase1.TeamName, subteamID keybase1.TeamID, admin *SCTeamAdmin) (*jsonw.Wrapper, error) {
+func NewSubteamSig(mctx libkb.MetaContext, me libkb.UserForSignatures, key libkb.GenericKey, parentTeam *TeamSigChainState, subteamName keybase1.TeamName, subteamID keybase1.TeamID, admin *SCTeamAdmin) (*jsonw.Wrapper, *hidden.Ratchet, error) {
+	g := mctx.G()
 	prevLinkID, err := libkb.ImportLinkID(parentTeam.GetLatestLinkID())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ret, err := libkb.ProofMetadata{
 		SigningUser: me,
@@ -78,12 +81,17 @@ func NewSubteamSig(g *libkb.GlobalContext, me libkb.UserForSignatures, key libkb
 		PrevLinkID:  prevLinkID,
 	}.ToJSON(metaContext(g))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	entropy, err := makeSCTeamEntropy()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	ratchet, err := hidden.MakeRatchet(mctx, parentTeam.GetID())
+	if err != nil {
+		return nil, nil, err
 	}
 
 	teamSection := SCTeamSection{
@@ -92,16 +100,17 @@ func NewSubteamSig(g *libkb.GlobalContext, me libkb.UserForSignatures, key libkb
 			ID:   (SCTeamID)(subteamID),
 			Name: (SCTeamName)(subteamName.String()),
 		},
-		Admin:   admin,
-		Entropy: entropy,
+		Admin:    admin,
+		Entropy:  entropy,
+		Ratchets: ratchet.ToTeamSection(),
 	}
 	teamSectionJSON, err := jsonw.WrapperFromObject(teamSection)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ret.SetValueAtPath("body.team", teamSectionJSON)
 
-	return ret, nil
+	return ret, ratchet, nil
 }
 
 func SubteamHeadSig(g *libkb.GlobalContext, me libkb.UserForSignatures, key libkb.GenericKey, subteamTeamSection SCTeamSection, merkleRoot libkb.MerkleRoot) (*jsonw.Wrapper, error) {
@@ -264,12 +273,38 @@ func seqTypeForTeamPublicness(public bool) keybase1.SeqType {
 }
 
 func precheckLinkToPost(ctx context.Context, g *libkb.GlobalContext,
-	sigMultiItem libkb.SigMultiItem, state *TeamSigChainState, me keybase1.UserVersion) (err error) {
+	sigMultiItem libkb.SigMultiItem, state *TeamSigChainState,
+	me keybase1.UserVersion) (err error) {
 	return precheckLinksToPost(ctx, g, []libkb.SigMultiItem{sigMultiItem}, state, me)
 }
 
+func AppendChainLinkSig3(ctx context.Context, g *libkb.GlobalContext,
+	sig libkb.Sig3, state *TeamSigChainState,
+	me keybase1.UserVersion) (err error) {
+
+	mctx := libkb.NewMetaContext(ctx, g)
+
+	if len(sig.Outer) == 0 || len(sig.Sig) == 0 {
+		return NewPrecheckStructuralError("got a stubbed v3 link on post, which isn't allowed", nil)
+	}
+
+	hp := hidden.NewLoaderPackageForPrecheck(mctx, state.GetID(), state.hidden)
+	ex := sig3.ExportJSON{
+		Inner: sig.Inner,
+		Outer: sig.Outer,
+		Sig:   sig.Sig,
+	}
+	err = hp.Update(mctx, []sig3.ExportJSON{ex})
+	if err != nil {
+		return err
+	}
+	mctx.Debug("AppendChainLinkSig3 success for %s", sig.Outer)
+	return nil
+}
+
 func precheckLinksToPost(ctx context.Context, g *libkb.GlobalContext,
-	sigMultiItems []libkb.SigMultiItem, state *TeamSigChainState, me keybase1.UserVersion) (err error) {
+	sigMultiItems []libkb.SigMultiItem, state *TeamSigChainState,
+	me keybase1.UserVersion) (err error) {
 
 	defer g.CTraceTimed(ctx, "precheckLinksToPost", func() error { return err })()
 
@@ -293,6 +328,16 @@ func precheckLinksToPost(ctx context.Context, g *libkb.GlobalContext,
 	}
 
 	for i, sigItem := range sigMultiItems {
+
+		if sigItem.Sig3 != nil {
+			err = AppendChainLinkSig3(ctx, g, *sigItem.Sig3, state, me)
+			if err != nil {
+				g.Log.CDebugf(ctx, "precheckLinksToPost: link (sig3) %v/%v rejected: %v", i+1, len(sigMultiItems), err)
+				return NewPrecheckAppendError(err)
+			}
+			continue
+		}
+
 		outerLink, err := libkb.DecodeOuterLinkV2(sigItem.Sig)
 		if err != nil {
 			return NewPrecheckStructuralError("unpack outer", err)

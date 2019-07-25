@@ -26,7 +26,6 @@ const (
 	// error param keys
 	errorParamTlf                 = "tlf"
 	errorParamMode                = "mode"
-	errorParamFeature             = "feature"
 	errorParamUsername            = "username"
 	errorParamRekeySelf           = "rekeyself"
 	errorParamUsageBytes          = "usageBytes"
@@ -41,39 +40,10 @@ const (
 	// error operation modes
 	errorModeRead  = "read"
 	errorModeWrite = "write"
-
-	// features that aren't ready yet
-	errorFeatureFileLimit = "2gbFileLimit"
-	errorFeatureDirLimit  = "512kbDirLimit"
 )
 
 const connectionStatusConnected keybase1.FSStatusCode = keybase1.FSStatusCode_START
 const connectionStatusDisconnected keybase1.FSStatusCode = keybase1.FSStatusCode_ERROR
-
-// noErrorNames are lookup names that should not result in an error
-// notification.  These should all be reserved or illegal Keybase
-// usernames that will never be associated with a real account.
-var noErrorNames = map[string]bool{
-	"objects":        true, // git shells
-	"gemfile":        true, // rvm
-	"Gemfile":        true, // rvm
-	"devfs":          true, // lsof?  KBFS-823
-	"_mtn":           true, // emacs on Linux
-	"_MTN":           true, // emacs on Linux
-	"docker-machine": true, // docker shell stuff
-	"HEAD":           true, // git shell
-	"Keybase.app":    true, // some OSX mount thing
-	"DCIM":           true, // looking for digital pic folder
-	"Thumbs.db":      true, // Windows mounts
-	"config":         true, // Windows, possibly 7-Zip?
-	"m4root":         true, // OS X, iMovie?
-	"BDMV":           true, // OS X, iMovie?
-	"node_modules":   true, // Some npm shell configuration
-	"folder":         true, // Dolphin?  keybase/client#7304
-	"avchd":          true, // Sony PlayMemories Home, keybase/client#6801
-	"avchd_bk":       true, // Sony PlayMemories Home, keybase/client#6801
-	"sony":           true, // Sony PlayMemories Home, keybase/client#6801
-}
 
 // ReporterKBPKI implements the Notify function of the Reporter
 // interface in addition to embedding ReporterSimple for error
@@ -88,6 +58,7 @@ type ReporterKBPKI struct {
 	notifyPathBuffer        chan string
 	notifySyncBuffer        chan *keybase1.FSPathSyncStatus
 	notifyOverallSyncBuffer chan keybase1.FolderSyncStatus
+	notifyFavsBuffer        chan struct{}
 	shutdownCh              chan struct{}
 	canceler                func()
 
@@ -108,6 +79,7 @@ func NewReporterKBPKI(config Config, maxErrors, bufSize int) *ReporterKBPKI {
 		notifyPathBuffer:        make(chan string, 1),
 		notifySyncBuffer:        make(chan *keybase1.FSPathSyncStatus, 1),
 		notifyOverallSyncBuffer: make(chan keybase1.FolderSyncStatus, 1),
+		notifyFavsBuffer:        make(chan struct{}, 1),
 		shutdownCh:              make(chan struct{}),
 	}
 	var ctx context.Context
@@ -280,6 +252,18 @@ func (r *ReporterKBPKI) NotifySyncStatus(ctx context.Context,
 	}
 }
 
+// NotifyFavoritesChanged implements the Reporter interface for
+// ReporterSimple.
+func (r *ReporterKBPKI) NotifyFavoritesChanged(ctx context.Context) {
+	select {
+	case r.notifyFavsBuffer <- struct{}{}:
+	default:
+		r.vlog.CLogf(
+			ctx, libkb.VLog1, "ReporterKBPKI: notify favs buffer full, "+
+				"dropping")
+	}
+}
+
 // NotifyOverallSyncStatus implements the Reporter interface for ReporterKBPKI.
 func (r *ReporterKBPKI) NotifyOverallSyncStatus(
 	ctx context.Context, status keybase1.FolderSyncStatus) {
@@ -313,15 +297,21 @@ func (r *ReporterKBPKI) Shutdown() {
 	close(r.onlineStatusBuffer)
 	close(r.notifySyncBuffer)
 	close(r.notifyOverallSyncBuffer)
+	close(r.notifyFavsBuffer)
 }
 
-const reporterSendInterval = time.Second
+const (
+	reporterSendInterval    = time.Second
+	reporterFavSendInterval = 5 * time.Second
+)
 
 // send takes notifications out of notifyBuffer, notifyPathBuffer, and
 // notifySyncBuffer and sends them to the keybase daemon.
 func (r *ReporterKBPKI) send(ctx context.Context) {
 	sendTicker := time.NewTicker(reporterSendInterval)
 	defer sendTicker.Stop()
+	favSendTicker := time.NewTicker(reporterFavSendInterval)
+	defer favSendTicker.Stop()
 
 	for {
 		select {
@@ -336,6 +326,7 @@ func (r *ReporterKBPKI) send(ctx context.Context) {
 			if nt != keybase1.FSNotificationType_REKEYING &&
 				nt != keybase1.FSNotificationType_INITIALIZED &&
 				nt != keybase1.FSNotificationType_CONNECTION &&
+				nt != keybase1.FSNotificationType_SYNC_CONFIG_CHANGED &&
 				st != keybase1.FSStatusCode_ERROR {
 				continue
 			}
@@ -390,6 +381,19 @@ func (r *ReporterKBPKI) send(ctx context.Context) {
 					ctx, status); err != nil {
 					r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
 						"overall sync status: %s", err)
+				}
+			default:
+			}
+		case <-favSendTicker.C:
+			select {
+			case _, ok := <-r.notifyFavsBuffer:
+				if !ok {
+					return
+				}
+				if err := r.config.KeybaseService().NotifyFavoritesChanged(
+					ctx); err != nil {
+					r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
+						"favorites changed notification: %s", err)
 				}
 			default:
 			}
@@ -480,7 +484,9 @@ func fileRenameNotification(oldFile data.Path, newFile data.Path, writer keybase
 	localTime time.Time) *keybase1.FSNotification {
 	n := baseFileEditNotification(newFile, writer, localTime)
 	n.NotificationType = keybase1.FSNotificationType_FILE_RENAMED
-	n.Params = map[string]string{errorParamRenameOldFilename: oldFile.CanonicalPathString()}
+	n.Params = map[string]string{
+		errorParamRenameOldFilename: oldFile.CanonicalPathPlaintext(),
+	}
 	return n
 }
 
@@ -503,7 +509,7 @@ func baseNotification(file data.Path, finish bool) *keybase1.FSNotification {
 	}
 
 	return &keybase1.FSNotification{
-		Filename:   file.CanonicalPathString(),
+		Filename:   file.CanonicalPathPlaintext(),
 		StatusCode: code,
 	}
 }
@@ -556,6 +562,20 @@ func mdReadSuccessNotification(handle *tlfhandle.Handle,
 		Filename:         string(handle.GetCanonicalPath()),
 		StatusCode:       keybase1.FSStatusCode_START,
 		NotificationType: keybase1.FSNotificationType_MD_READ_SUCCESS,
+		Params:           params,
+	}
+}
+
+func syncConfigChangeNotification(handle *tlfhandle.Handle,
+	fsc keybase1.FolderSyncConfig) *keybase1.FSNotification {
+	params := map[string]string{
+		"syncMode": fsc.Mode.String(),
+	}
+	return &keybase1.FSNotification{
+		FolderType:       handle.Type().FolderType(),
+		Filename:         string(handle.GetCanonicalPath()),
+		StatusCode:       keybase1.FSStatusCode_START,
+		NotificationType: keybase1.FSNotificationType_SYNC_CONFIG_CHANGED,
 		Params:           params,
 	}
 }

@@ -108,7 +108,11 @@ func NewDeviceEKStorage(mctx libkb.MetaContext) *DeviceEKStorage {
 }
 
 func (s *DeviceEKStorage) SetLogPrefix(mctx libkb.MetaContext) {
-	s.logger.SetPrefix(getLogPrefix(mctx))
+	s.Lock()
+	defer s.Unlock()
+	if s.logger != nil {
+		s.logger.SetPrefix(getLogPrefix(mctx))
+	}
 }
 
 // Log sensitive deletion actions to a separate log file so we don't lose the
@@ -209,7 +213,7 @@ func (s *DeviceEKStorage) Put(mctx libkb.MetaContext, generation keybase1.EkGene
 
 	// sanity check that we got the right generation
 	if deviceEK.Metadata.Generation != generation {
-		return newEKCorruptedErr(mctx, DeviceEKStr, generation, deviceEK.Metadata.Generation)
+		return newEKCorruptedErr(mctx, DeviceEKKind, generation, deviceEK.Metadata.Generation)
 	}
 
 	key, err := s.key(mctx, generation)
@@ -285,7 +289,7 @@ func (s *DeviceEKStorage) get(mctx libkb.MetaContext, generation keybase1.EkGene
 	}
 	// sanity check that we got the right generation
 	if deviceEK.Metadata.Generation != generation {
-		return deviceEK, newEKCorruptedErr(mctx, DeviceEKStr, generation, deviceEK.Metadata.Generation)
+		return deviceEK, newEKCorruptedErr(mctx, DeviceEKKind, generation, deviceEK.Metadata.Generation)
 	}
 	return deviceEK, nil
 }

@@ -23,13 +23,19 @@ type Indexer struct {
 	sync.Mutex
 
 	// encrypted on-disk storage
-	store    *store
-	pageSize int
-	stopCh   chan chan struct{}
-	started  bool
+	store        *store
+	pageSize     int
+	stopCh       chan chan struct{}
+	suspendCh    chan chan struct{}
+	resumeCh     chan struct{}
+	suspendCount int
+	resumeWait   time.Duration
+	started      bool
 
-	maxSyncConvs   int
-	startSyncDelay time.Duration
+	maxSyncConvs          int
+	startSyncDelay        time.Duration
+	selectiveSyncActiveMu sync.Mutex
+	selectiveSyncActive   bool
 
 	// for testing
 	consumeCh                            chan chat1.ConversationID
@@ -46,6 +52,8 @@ func NewIndexer(g *globals.Context) *Indexer {
 		store:        newStore(g),
 		pageSize:     defaultPageSize,
 		stopCh:       make(chan chan struct{}, 10),
+		suspendCh:    make(chan chan struct{}, 10),
+		resumeWait:   time.Second,
 		cancelSyncCh: make(chan struct{}, 100),
 		pokeSyncCh:   make(chan struct{}, 100),
 	}
@@ -97,8 +105,10 @@ func (idx *Indexer) Start(ctx context.Context, uid gregor1.UID) {
 	if idx.started {
 		return
 	}
-	idx.started = true
-	go idx.SyncLoop(ctx, uid)
+	if !idx.G().IsMobileAppType() {
+		idx.started = true
+		go idx.SyncLoop(ctx, uid)
+	}
 }
 
 func (idx *Indexer) CancelSync(ctx context.Context) {
@@ -122,9 +132,14 @@ func (idx *Indexer) PokeSync(ctx context.Context) {
 func (idx *Indexer) SyncLoop(ctx context.Context, uid gregor1.UID) {
 	idx.Lock()
 	stopCh := idx.stopCh
+	suspendCh := idx.suspendCh
 	idx.Unlock()
 	idx.Debug(ctx, "starting SelectiveSync bg loop")
 
+	ticker := libkb.NewBgTicker(time.Hour)
+	after := time.After(idx.startSyncDelay)
+	appState := keybase1.MobileAppState_FOREGROUND
+	netState := keybase1.MobileNetworkState_WIFI
 	var cancelFn context.CancelFunc
 	var l sync.Mutex
 	cancelSync := func() {
@@ -136,6 +151,9 @@ func (idx *Indexer) SyncLoop(ctx context.Context, uid gregor1.UID) {
 		}
 	}
 	attemptSync := func(ctx context.Context) {
+		if netState.IsLimited() {
+			return
+		}
 		l.Lock()
 		defer l.Unlock()
 		if cancelFn != nil {
@@ -158,9 +176,13 @@ func (idx *Indexer) SyncLoop(ctx context.Context, uid gregor1.UID) {
 			}
 		}()
 	}
-	ticker := libkb.NewBgTicker(time.Hour)
-	after := time.After(idx.startSyncDelay)
-	state := keybase1.MobileAppState_FOREGROUND
+
+	stopSync := func(ctx context.Context, ch chan struct{}) {
+		idx.Debug(ctx, "stopping SelectiveSync bg loop")
+		cancelSync()
+		ticker.Stop()
+		close(ch)
+	}
 	for {
 		select {
 		case <-idx.cancelSyncCh:
@@ -171,18 +193,30 @@ func (idx *Indexer) SyncLoop(ctx context.Context, uid gregor1.UID) {
 			attemptSync(ctx)
 		case <-ticker.C:
 			attemptSync(ctx)
-		case state = <-idx.G().MobileAppState.NextUpdate(&state):
-			switch state {
+		case appState = <-idx.G().MobileAppState.NextUpdate(&appState):
+			switch appState {
 			case keybase1.MobileAppState_FOREGROUND:
 			// if we enter any state besides foreground cancel any running syncs
 			default:
 				cancelSync()
 			}
-		case ch := <-stopCh:
-			idx.Debug(ctx, "stopping SelectiveSync bg loop")
+		case netState = <-idx.G().MobileNetState.NextUpdate(&netState):
+			if netState.IsLimited() {
+				// if we switch off of wifi cancel any running syncs
+				cancelSync()
+			}
+		case ch := <-suspendCh:
 			cancelSync()
-			ticker.Stop()
-			close(ch)
+			// block until we are told to resume or stop.
+			select {
+			case <-ch:
+				time.Sleep(idx.resumeWait)
+			case ch := <-idx.stopCh:
+				stopSync(ctx, ch)
+				return
+			}
+		case ch := <-stopCh:
+			stopSync(ctx, ch)
 			return
 		}
 	}
@@ -201,6 +235,40 @@ func (idx *Indexer) Stop(ctx context.Context) chan struct{} {
 		close(ch)
 	}
 	return ch
+}
+
+func (idx *Indexer) Suspend(ctx context.Context) bool {
+	defer idx.Trace(ctx, func() error { return nil }, "Suspend")()
+	idx.Lock()
+	defer idx.Unlock()
+	if !idx.started {
+		return false
+	}
+	if idx.suspendCount == 0 {
+		idx.Debug(ctx, "Suspend: sending on suspendCh")
+		idx.resumeCh = make(chan struct{})
+		select {
+		case idx.suspendCh <- idx.resumeCh:
+		default:
+			idx.Debug(ctx, "Suspend: failed to suspend loop")
+		}
+	}
+	idx.suspendCount++
+	return true
+}
+
+func (idx *Indexer) Resume(ctx context.Context) bool {
+	defer idx.Trace(ctx, func() error { return nil }, "Resume")()
+	idx.Lock()
+	defer idx.Unlock()
+	if idx.suspendCount > 0 {
+		idx.suspendCount--
+		if idx.suspendCount == 0 && idx.resumeCh != nil {
+			close(idx.resumeCh)
+			return true
+		}
+	}
+	return false
 }
 
 // validBatch verifies the topic type is CHAT
@@ -335,7 +403,8 @@ func (idx *Indexer) reindexConv(ctx context.Context, rconv types.RemoteConversat
 				if err != nil {
 					idx.Debug(ctx, "unable to update ui %v", err)
 				} else {
-					idx.Debug(ctx, "%v is %d%% indexed", rconv.GetName(), percentIndexed)
+					idx.Debug(ctx, "%v is %d%% indexed, inbox is %d%% indexed",
+						rconv.GetName(), md.PercentIndexed(conv), percentIndexed)
 				}
 			}
 		}
@@ -452,11 +521,25 @@ func (idx *Indexer) Search(ctx context.Context, uid gregor1.UID, query, origQuer
 	return sess.run(ctx)
 }
 
+func (idx *Indexer) IsBackgroundActive() bool {
+	idx.selectiveSyncActiveMu.Lock()
+	defer idx.selectiveSyncActiveMu.Unlock()
+	return idx.selectiveSyncActive
+}
+
+func (idx *Indexer) setSelectiveSyncActive(val bool) {
+	idx.selectiveSyncActiveMu.Lock()
+	defer idx.selectiveSyncActiveMu.Unlock()
+	idx.selectiveSyncActive = val
+}
+
 // SelectiveSync queues up a small number of jobs on the background loader
 // periodically so our index can cover all conversations. The number of jobs
 // varies between desktop and mobile so mobile can be more conservative.
 func (idx *Indexer) SelectiveSync(ctx context.Context, uid gregor1.UID) (err error) {
 	defer idx.Trace(ctx, func() error { return err }, "SelectiveSync")()
+	idx.setSelectiveSyncActive(true)
+	defer func() { idx.setSelectiveSyncActive(false) }()
 
 	convMap, err := idx.allConvs(ctx, uid, nil)
 	if err != nil {

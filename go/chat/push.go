@@ -27,6 +27,8 @@ import (
 	"golang.org/x/net/context"
 )
 
+var errPushOrdererMissingLatestInboxVersion = errors.New("no latest inbox version")
+
 type messageWaiterEntry struct {
 	vers chat1.InboxVers
 	cb   chan struct{}
@@ -64,6 +66,9 @@ func (g *gregorMessageOrderer) latestInboxVersion(ctx context.Context, uid grego
 	vers, err := ibox.Version(ctx, uid)
 	if err != nil {
 		return 0, err
+	}
+	if vers == 0 {
+		return 0, errPushOrdererMissingLatestInboxVersion
 	}
 	return vers, nil
 }
@@ -125,17 +130,32 @@ func (g *gregorMessageOrderer) WaitForTurn(ctx context.Context, uid gregor1.UID,
 	go func(ctx context.Context) {
 		defer close(res)
 		g.Lock()
+		var dur time.Duration
 		vers, err := g.latestInboxVersion(ctx, uid)
 		if err != nil {
-			vers = newVers - 1
-			g.Debug(ctx, "WaitForTurn: failed to get current inbox version: %v. Proceeding with vers %d",
+			if newVers >= 2 {
+				// If we fail to get the inbox version, then the general goal is to just simulate like
+				// we are looking for the previous update to the one we just got (newVers). In order to do
+				// this, we act like our previous inbox version was just missing the inbox version one less
+				// than newVers. That means we are waiting for this single update (which probably isn't
+				// coming, we usually get here if we miss the inbox cache on disk).
+				vers = newVers - 2
+			} else {
+				vers = 0
+			}
+			g.Debug(ctx, "WaitForTurn: failed to get current inbox version: %s, proceeding with vers %d",
 				err, vers)
 		}
 		// add extra time if we are multiple updates behind
-		dur := time.Duration(newVers-vers-1) * time.Second
+		dur = time.Duration(newVers-vers-1) * time.Second
 		if dur < 0 {
 			dur = 0
 		}
+		// cap at a minute
+		if dur > time.Minute {
+			dur = time.Minute
+		}
+
 		deadline = deadline.Add(dur)
 		waiters := g.addToWaitersLocked(ctx, uid, vers, newVers)
 		g.Unlock()
@@ -190,6 +210,9 @@ type PushHandler struct {
 	identNotifier types.IdentifyNotifier
 	orderer       *gregorMessageOrderer
 	typingMonitor *TypingMonitor
+
+	// testing only
+	testingIgnoreBroadcasts bool
 }
 
 func NewPushHandler(g *globals.Context) *PushHandler {
@@ -516,8 +539,9 @@ func (g *PushHandler) Activity(ctx context.Context, m gregor.OutOfBandMessage) (
 				g.Debug(ctx, "chat activity: error decoding newMessage: %v", err)
 				return
 			}
-			g.Debug(ctx, "chat activity: newMessage: convID: %s sender: %s msgID: %d",
-				nm.ConvID, nm.Message.ClientHeader.Sender, nm.Message.GetMessageID())
+			g.Debug(ctx, "chat activity: newMessage: convID: %s sender: %s msgID: %d typ: %v",
+				nm.ConvID, nm.Message.ClientHeader.Sender, nm.Message.GetMessageID(),
+				nm.Message.GetMessageType())
 			if nm.Message.ClientHeader.OutboxID != nil {
 				g.Debug(ctx, "chat activity: newMessage: outboxID: %s",
 					hex.EncodeToString(*nm.Message.ClientHeader.OutboxID))
@@ -542,6 +566,9 @@ func (g *PushHandler) Activity(ctx context.Context, m gregor.OutOfBandMessage) (
 			if nm.Message.GetMessageType() == chat1.MessageType_LEAVE &&
 				nm.Message.ClientHeader.Sender.Eq(uid) {
 				g.Debug(ctx, "chat activity: ignoring leave message from oursevles")
+				if err := g.G().InboxSource.UpdateInboxVersion(ctx, uid, nm.InboxVers); err != nil {
+					g.Debug(ctx, "chat activity: failed to update inbox version: %s", err)
+				}
 				return
 			}
 
@@ -574,8 +601,12 @@ func (g *PushHandler) Activity(ctx context.Context, m gregor.OutOfBandMessage) (
 				desktopNotification := g.shouldDisplayDesktopNotification(ctx, uid, conv, decmsg)
 				notificationSnippet := ""
 				if desktopNotification {
+					plaintextDesktopDisabled, err := getPlaintextDesktopDisabled(ctx, g.G())
+					if err != nil {
+						g.Debug(ctx, "chat activity: unable to get app notification settings: %v defaulting to disable plaintext", err)
+					}
 					notificationSnippet = utils.GetDesktopNotificationSnippet(conv,
-						g.G().Env.GetUsername().String(), &decmsg)
+						g.G().Env.GetUsername().String(), &decmsg, plaintextDesktopDisabled)
 				}
 				activity = new(chat1.ChatActivity)
 				*activity = chat1.NewChatActivityWithIncomingMessage(chat1.IncomingMessage{
@@ -1208,11 +1239,33 @@ func (g *PushHandler) SubteamRename(ctx context.Context, m gregor.OutOfBandMessa
 
 		convUIItems := make(map[chat1.TopicType][]chat1.InboxUIItem)
 		convIDs := make(map[chat1.TopicType][]chat1.ConversationID)
+		tlfIDs := make(map[string]struct{})
 		for _, conv := range convs {
+			tlfIDs[conv.Info.Triple.Tlfid.String()] = struct{}{}
 			uiItem := g.presentUIItem(ctx, &conv, uid)
 			if uiItem != nil {
 				convUIItems[uiItem.TopicType] = append(convUIItems[uiItem.TopicType], *uiItem)
 				convIDs[uiItem.TopicType] = append(convIDs[uiItem.TopicType], conv.GetConvID())
+			}
+		}
+
+		// force refresh any affected teams
+		m := libkb.NewMetaContext(ctx, g.G().ExternalG())
+		for tlfID := range tlfIDs {
+			teamID, err := keybase1.TeamIDFromString(tlfID)
+			if err != nil {
+				g.Debug(ctx, "SubteamRename: unable to get teamID: %v", err)
+				continue
+			}
+
+			_, err = m.G().GetFastTeamLoader().Load(m, keybase1.FastTeamLoadArg{
+				ID:           teamID,
+				Public:       teamID.IsPublic(),
+				ForceRefresh: true,
+			})
+			if err != nil {
+				g.Debug(ctx, "SubteamRename: unable to force-refresh team: %v", err)
+				continue
 			}
 		}
 		for topicType, items := range convUIItems {
@@ -1225,6 +1278,9 @@ func (g *PushHandler) SubteamRename(ctx context.Context, m gregor.OutOfBandMessa
 }
 
 func (g *PushHandler) HandleOobm(ctx context.Context, obm gregor.OutOfBandMessage) (bool, error) {
+	if g.testingIgnoreBroadcasts {
+		return false, errors.New("ignoring broadcasts for tests")
+	}
 	if obm.System() == nil {
 		return false, errors.New("nil system in out of band message")
 	}

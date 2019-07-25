@@ -354,6 +354,14 @@ func (u *Uploader) getBaseDir() string {
 	return baseDir
 }
 
+// normalizeFilenameFromCache substitutes the existing cache dir value into the
+// file path since it's possible for the path to the cache dir to change,
+// especially on mobile.
+func (u *Uploader) normalizeFilenameFromCache(dir, file string) string {
+	file = filepath.Base(file)
+	return filepath.Join(dir, file)
+}
+
 func (u *Uploader) uploadFile(ctx context.Context, diskLRU *disklru.DiskLRU, dirname, prefix string) (f *os.File, err error) {
 	baseDir := u.getBaseDir()
 	dir := filepath.Join(baseDir, dirname)
@@ -366,14 +374,14 @@ func (u *Uploader) uploadFile(ctx context.Context, diskLRU *disklru.DiskLRU, dir
 	}
 
 	// Add an entry to the disk LRU mapping with the tmpfilename to limit the
-	// number of resources on disk.  If we evict something we remove the
-	// remnants .
+	// number of resources on disk. If we evict something we remove the
+	// remnants.
 	evicted, err := diskLRU.Put(ctx, u.G(), f.Name(), f.Name())
 	if err != nil {
 		return nil, err
 	}
 	if evicted != nil {
-		path := evicted.Value.(string)
+		path := u.normalizeFilenameFromCache(dir, evicted.Value.(string))
 		if oerr := os.Remove(path); oerr != nil {
 			u.Debug(ctx, "failed to remove file at %s, %v", path, oerr)
 		}
@@ -454,7 +462,7 @@ func (u *Uploader) upload(ctx context.Context, uid gregor1.UID, convID chat1.Con
 	pp := NewPendingPreviews(u.G())
 	if pre, err = pp.Get(ctx, outboxID); err != nil {
 		u.Debug(ctx, "upload: no pending preview, generating one: %s", err)
-		if pre, err = PreprocessAsset(ctx, u.DebugLabeler, src, filename, u.G().NativeVideoHelper,
+		if pre, err = PreprocessAsset(ctx, u.G(), u.DebugLabeler, src, filename, u.G().NativeVideoHelper,
 			callerPreview); err != nil {
 			return res, err
 		}
@@ -625,11 +633,11 @@ func (u *Uploader) GetUploadTempFile(ctx context.Context, outboxID chat1.OutboxI
 func (u *Uploader) OnDbNuke(mctx libkb.MetaContext) error {
 	baseDir := u.getBaseDir()
 	previewsDir := filepath.Join(baseDir, uploadedPreviewsDir)
-	if err := u.previewsLRU.Clean(mctx.Ctx(), mctx.G(), previewsDir); err != nil {
+	if err := u.previewsLRU.CleanOutOfSync(mctx, previewsDir); err != nil {
 		u.Debug(mctx.Ctx(), "unable to run clean for uploadedPreviews: %v", err)
 	}
 	fullsDir := filepath.Join(baseDir, uploadedFullsDir)
-	if err := u.fullsLRU.Clean(mctx.Ctx(), mctx.G(), fullsDir); err != nil {
+	if err := u.fullsLRU.CleanOutOfSync(mctx, fullsDir); err != nil {
 		u.Debug(mctx.Ctx(), "unable to run clean for uploadedFulls: %v", err)
 	}
 	return nil

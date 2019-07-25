@@ -7,6 +7,7 @@ import (
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/client/go/teams/hidden"
 )
 
 type SCTeamName string
@@ -28,29 +29,31 @@ type SCTeamMember keybase1.UserVersion
 type SCMapInviteIDToUV map[keybase1.TeamInviteID]keybase1.UserVersionPercentForm
 
 type SCTeamSection struct {
-	ID               SCTeamID              `json:"id"`
-	Name             *SCTeamName           `json:"name,omitempty"`
-	Members          *SCTeamMembers        `json:"members,omitempty"`
-	Parent           *SCTeamParent         `json:"parent,omitempty"`
-	Subteam          *SCSubteam            `json:"subteam,omitempty"`
-	PerTeamKey       *SCPerTeamKey         `json:"per_team_key,omitempty"`
-	Admin            *SCTeamAdmin          `json:"admin,omitempty"`
-	Invites          *SCTeamInvites        `json:"invites,omitempty"`
-	CompletedInvites SCMapInviteIDToUV     `json:"completed_invites,omitempty"`
-	Implicit         bool                  `json:"is_implicit,omitempty"`
-	Public           bool                  `json:"is_public,omitempty"`
-	Entropy          SCTeamEntropy         `json:"entropy,omitempty"`
-	Settings         *SCTeamSettings       `json:"settings,omitempty"`
-	KBFS             *SCTeamKBFS           `json:"kbfs,omitempty"`
-	BoxSummaryHash   *SCTeamBoxSummaryHash `json:"box_summary_hash,omitempty"`
+	ID               SCTeamID               `json:"id"`
+	Name             *SCTeamName            `json:"name,omitempty"`
+	Members          *SCTeamMembers         `json:"members,omitempty"`
+	Parent           *SCTeamParent          `json:"parent,omitempty"`
+	Subteam          *SCSubteam             `json:"subteam,omitempty"`
+	PerTeamKey       *SCPerTeamKey          `json:"per_team_key,omitempty"`
+	Admin            *SCTeamAdmin           `json:"admin,omitempty"`
+	Invites          *SCTeamInvites         `json:"invites,omitempty"`
+	CompletedInvites SCMapInviteIDToUV      `json:"completed_invites,omitempty"`
+	Implicit         bool                   `json:"is_implicit,omitempty"`
+	Public           bool                   `json:"is_public,omitempty"`
+	Entropy          SCTeamEntropy          `json:"entropy,omitempty"`
+	Settings         *SCTeamSettings        `json:"settings,omitempty"`
+	KBFS             *SCTeamKBFS            `json:"kbfs,omitempty"`
+	BoxSummaryHash   *SCTeamBoxSummaryHash  `json:"box_summary_hash,omitempty"`
+	Ratchets         []hidden.SCTeamRatchet `json:"ratchets,omitempty"`
 }
 
 type SCTeamMembers struct {
-	Owners  *[]SCTeamMember `json:"owner,omitempty"`
-	Admins  *[]SCTeamMember `json:"admin,omitempty"`
-	Writers *[]SCTeamMember `json:"writer,omitempty"`
-	Readers *[]SCTeamMember `json:"reader,omitempty"`
-	None    *[]SCTeamMember `json:"none,omitempty"`
+	Owners         *[]SCTeamMember `json:"owner,omitempty"`
+	Admins         *[]SCTeamMember `json:"admin,omitempty"`
+	Writers        *[]SCTeamMember `json:"writer,omitempty"`
+	Readers        *[]SCTeamMember `json:"reader,omitempty"`
+	RestrictedBots *[]SCTeamMember `json:"restricted_bot,omitempty"`
+	None           *[]SCTeamMember `json:"none,omitempty"`
 }
 
 type SCTeamInvites struct {
@@ -89,6 +92,7 @@ type SCPerTeamKey struct {
 	EncKID     keybase1.KID                  `json:"encryption_kid"`
 	SigKID     keybase1.KID                  `json:"signing_kid"`
 	ReverseSig string                        `json:"reverse_sig"`
+	SeedCheck  string                        `json:"seed_check,omitempty"`
 }
 
 type SCTeamSettings struct {
@@ -118,6 +122,26 @@ type SCTeamKBFSLegacyUpgrade struct {
 	TeamGeneration   keybase1.PerTeamKeyGeneration        `json:"team_generation"`
 	LegacyGeneration int                                  `json:"legacy_generation"`
 	KeysetHash       keybase1.TeamEncryptedKBFSKeysetHash `json:"encrypted_keyset_hash"`
+}
+
+func (i SCTeamInvites) Len() int {
+	size := 0
+	if i.Owners != nil {
+		size += len(*i.Owners)
+	}
+	if i.Admins != nil {
+		size += len(*i.Admins)
+	}
+	if i.Writers != nil {
+		size += len(*i.Writers)
+	}
+	if i.Readers != nil {
+		size += len(*i.Readers)
+	}
+	if i.Cancel != nil {
+		size += len(*i.Cancel)
+	}
+	return size
 }
 
 func (a SCTeamAdmin) SigChainLocation() keybase1.SigChainLocation {
@@ -223,6 +247,14 @@ func (s SCChainLinkPayload) TeamAdmin() *SCTeamAdmin {
 	return t.Admin
 }
 
+func (s SCChainLinkPayload) Ratchets() []hidden.SCTeamRatchet {
+	t := s.Body.Team
+	if t == nil {
+		return nil
+	}
+	return t.Ratchets
+}
+
 func (s SCChainLinkPayload) TeamID() (keybase1.TeamID, error) {
 	t := s.Body.Team
 	if t == nil {
@@ -243,12 +275,12 @@ func (i SCTeamInviteID) Eq(i2 keybase1.TeamInviteID) bool {
 	return tmp.Eq(i2)
 }
 
-func (i SCTeamInvite) TeamInvite(g *libkb.GlobalContext, r keybase1.TeamRole, inviter keybase1.UserVersion) (keybase1.TeamInvite, error) {
+func (i SCTeamInvite) TeamInvite(mctx libkb.MetaContext, r keybase1.TeamRole, inviter keybase1.UserVersion) (keybase1.TeamInvite, error) {
 	id, err := i.ID.TeamInviteID()
 	if err != nil {
 		return keybase1.TeamInvite{}, err
 	}
-	typ, err := keybase1.TeamInviteTypeFromString(string(i.Type), g.Env.GetRunMode() == libkb.DevelRunMode)
+	typ, err := TeamInviteTypeFromString(mctx, string(i.Type))
 	if err != nil {
 		return keybase1.TeamInvite{}, err
 	}

@@ -34,8 +34,22 @@ type FSOverallSyncStatusChangedArg struct {
 	Status FolderSyncStatus `codec:"status" json:"status"`
 }
 
+type FSFavoritesChangedArg struct {
+}
+
 type FSOnlineStatusChangedArg struct {
 	Online bool `codec:"online" json:"online"`
+}
+
+type FSSubscriptionNotifyPathArg struct {
+	SubscriptionID string                `codec:"subscriptionID" json:"subscriptionID"`
+	Path           string                `codec:"path" json:"path"`
+	Topic          PathSubscriptionTopic `codec:"topic" json:"topic"`
+}
+
+type FSSubscriptionNotifyArg struct {
+	SubscriptionID string            `codec:"subscriptionID" json:"subscriptionID"`
+	Topic          SubscriptionTopic `codec:"topic" json:"topic"`
 }
 
 type NotifyFSInterface interface {
@@ -45,7 +59,10 @@ type NotifyFSInterface interface {
 	FSEditListResponse(context.Context, FSEditListResponseArg) error
 	FSSyncStatusResponse(context.Context, FSSyncStatusResponseArg) error
 	FSOverallSyncStatusChanged(context.Context, FolderSyncStatus) error
+	FSFavoritesChanged(context.Context) error
 	FSOnlineStatusChanged(context.Context, bool) error
+	FSSubscriptionNotifyPath(context.Context, FSSubscriptionNotifyPathArg) error
+	FSSubscriptionNotify(context.Context, FSSubscriptionNotifyArg) error
 }
 
 func NotifyFSProtocol(i NotifyFSInterface) rpc.Protocol {
@@ -142,6 +159,16 @@ func NotifyFSProtocol(i NotifyFSInterface) rpc.Protocol {
 					return
 				},
 			},
+			"FSFavoritesChanged": {
+				MakeArg: func() interface{} {
+					var ret [1]FSFavoritesChangedArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					err = i.FSFavoritesChanged(ctx)
+					return
+				},
+			},
 			"FSOnlineStatusChanged": {
 				MakeArg: func() interface{} {
 					var ret [1]FSOnlineStatusChangedArg
@@ -154,6 +181,36 @@ func NotifyFSProtocol(i NotifyFSInterface) rpc.Protocol {
 						return
 					}
 					err = i.FSOnlineStatusChanged(ctx, typedArgs[0].Online)
+					return
+				},
+			},
+			"FSSubscriptionNotifyPath": {
+				MakeArg: func() interface{} {
+					var ret [1]FSSubscriptionNotifyPathArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]FSSubscriptionNotifyPathArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]FSSubscriptionNotifyPathArg)(nil), args)
+						return
+					}
+					err = i.FSSubscriptionNotifyPath(ctx, typedArgs[0])
+					return
+				},
+			},
+			"FSSubscriptionNotify": {
+				MakeArg: func() interface{} {
+					var ret [1]FSSubscriptionNotifyArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]FSSubscriptionNotifyArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]FSSubscriptionNotifyArg)(nil), args)
+						return
+					}
+					err = i.FSSubscriptionNotify(ctx, typedArgs[0])
 					return
 				},
 			},
@@ -199,8 +256,23 @@ func (c NotifyFSClient) FSOverallSyncStatusChanged(ctx context.Context, status F
 	return
 }
 
+func (c NotifyFSClient) FSFavoritesChanged(ctx context.Context) (err error) {
+	err = c.Cli.Notify(ctx, "keybase.1.NotifyFS.FSFavoritesChanged", []interface{}{FSFavoritesChangedArg{}})
+	return
+}
+
 func (c NotifyFSClient) FSOnlineStatusChanged(ctx context.Context, online bool) (err error) {
 	__arg := FSOnlineStatusChangedArg{Online: online}
 	err = c.Cli.Notify(ctx, "keybase.1.NotifyFS.FSOnlineStatusChanged", []interface{}{__arg})
+	return
+}
+
+func (c NotifyFSClient) FSSubscriptionNotifyPath(ctx context.Context, __arg FSSubscriptionNotifyPathArg) (err error) {
+	err = c.Cli.Notify(ctx, "keybase.1.NotifyFS.FSSubscriptionNotifyPath", []interface{}{__arg})
+	return
+}
+
+func (c NotifyFSClient) FSSubscriptionNotify(ctx context.Context, __arg FSSubscriptionNotifyArg) (err error) {
+	err = c.Cli.Notify(ctx, "keybase.1.NotifyFS.FSSubscriptionNotify", []interface{}{__arg})
 	return
 }

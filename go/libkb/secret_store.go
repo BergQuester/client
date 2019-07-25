@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 )
@@ -109,24 +110,52 @@ func NewSecretStore(g *GlobalContext, username NormalizedUsername) SecretStore {
 	return nil
 }
 
-func GetConfiguredAccounts(m MetaContext, s SecretStoreAll) ([]keybase1.ConfiguredAccount, error) {
-
-	currentUsername, allUsernames, err := GetAllProvisionedUsernames(m)
-	if err != nil {
-		return nil, err
-	}
-
+func GetConfiguredAccountsFromProvisionedUsernames(m MetaContext, s SecretStoreAll, currentUsername NormalizedUsername, allUsernames []NormalizedUsername) ([]keybase1.ConfiguredAccount, error) {
 	if !currentUsername.IsNil() {
 		allUsernames = append(allUsernames, currentUsername)
 	}
 
 	accounts := make(map[NormalizedUsername]keybase1.ConfiguredAccount)
-
 	for _, username := range allUsernames {
 		accounts[username] = keybase1.ConfiguredAccount{
-			Username: username.String(),
+			Username:  username.String(),
+			IsCurrent: username.Eq(currentUsername),
 		}
 	}
+
+	// Get the full names
+
+	uids := make([]keybase1.UID, len(allUsernames))
+	for idx, username := range allUsernames {
+		uid := m.G().UIDMapper.MapHardcodedUsernameToUID(username)
+		if !uid.Exists() {
+			uid = UsernameToUIDPreserveCase(username.String())
+		}
+		uids[idx] = uid
+	}
+	usernamePackages, err := m.G().UIDMapper.MapUIDsToUsernamePackages(m.Ctx(), m.G(),
+		uids, time.Hour*24, time.Second*10, false)
+	if err != nil {
+		if usernamePackages != nil {
+			// If data is returned, interpret the error as a warning
+			m.G().Log.CInfof(m.Ctx(),
+				"error while retrieving full names: %+v", err)
+		} else {
+			return nil, err
+		}
+	}
+	for _, uPackage := range usernamePackages {
+		if uPackage.FullName == nil {
+			continue
+		}
+		if account, ok := accounts[uPackage.NormalizedUsername]; ok {
+			account.Fullname = uPackage.FullName.FullName
+			accounts[uPackage.NormalizedUsername] = account
+		}
+	}
+
+	// Check for secrets
+
 	var storedSecretUsernames []string
 	if s != nil {
 		storedSecretUsernames, err = s.GetUsersWithStoredSecrets(m)
@@ -150,6 +179,14 @@ func GetConfiguredAccounts(m MetaContext, s SecretStoreAll) ([]keybase1.Configur
 	}
 
 	return configuredAccounts, nil
+}
+
+func GetConfiguredAccounts(m MetaContext, s SecretStoreAll) ([]keybase1.ConfiguredAccount, error) {
+	currentUsername, allUsernames, err := GetAllProvisionedUsernames(m)
+	if err != nil {
+		return nil, err
+	}
+	return GetConfiguredAccountsFromProvisionedUsernames(m, s, currentUsername, allUsernames)
 }
 
 func ClearStoredSecret(m MetaContext, username NormalizedUsername) error {
@@ -276,6 +313,10 @@ func (s *SecretStoreLocked) GetUsersWithStoredSecrets(m MetaContext) ([]string, 
 }
 
 func (s *SecretStoreLocked) PrimeSecretStores(mctx MetaContext) (err error) {
+	if mctx.G().Env.GetSecretStorePrimingDisabled() {
+		mctx.Debug("Skipping PrimeSecretStores, disabled in env")
+		return nil
+	}
 	if s == nil || s.isNil() {
 		return errors.New("secret store is not available")
 	}
@@ -312,6 +353,11 @@ func (s *SecretStoreLocked) SetOptions(mctx MetaContext, options *SecretStoreOpt
 // store, retrieve, and then delete a secret with an arbitrary name. This should
 // be done before provisioning or logging in
 func PrimeSecretStore(mctx MetaContext, ss SecretStoreAll) (err error) {
+	defer func() {
+		if err != nil {
+			go reportPrimeSecretStoreFailure(mctx.BackgroundWithLogTags(), ss, err)
+		}
+	}()
 	defer mctx.TraceTimed("PrimeSecretStore", func() error { return err })()
 
 	// Generate test username and test secret
@@ -371,6 +417,31 @@ func PrimeSecretStore(mctx MetaContext, ss SecretStoreAll) (err error) {
 
 	mctx.Debug("PrimeSecretStore: retrieved secret matched!")
 	return nil
+}
+
+func reportPrimeSecretStoreFailure(mctx MetaContext, ss SecretStoreAll, reportErr error) {
+	var err error
+	defer mctx.TraceTimed("reportPrimeSecretStoreFailure", func() error { return err })()
+	osVersion, osBuild, err := OSVersionAndBuild()
+	if err != nil {
+		mctx.Debug("os info error: %v", err)
+	}
+	apiArg := APIArg{
+		Endpoint:    "device/error",
+		SessionType: APISessionTypeNONE,
+		Args: HTTPArgs{
+			"event":      S{Val: "prime_secret_store"},
+			"msg":        S{Val: fmt.Sprintf("[%T] [%T] %v", ss, reportErr, reportErr.Error())},
+			"run_mode":   S{Val: string(mctx.G().GetRunMode())},
+			"kb_version": S{Val: VersionString()},
+			"os_version": S{Val: osVersion},
+			"os_build":   S{Val: osBuild},
+		},
+		RetryCount:     3,
+		InitialTimeout: 10 * time.Second,
+	}
+	var apiRes AppStatusEmbed
+	err = mctx.G().API.PostDecode(mctx, apiArg, &apiRes)
 }
 
 func notifySecretStoreCreate(g *GlobalContext, username NormalizedUsername) {

@@ -42,6 +42,24 @@
     },
     {
       "type": "record",
+      "name": "DeletedTeamInfo",
+      "fields": [
+        {
+          "type": "string",
+          "name": "teamName"
+        },
+        {
+          "type": "string",
+          "name": "deletedBy"
+        },
+        {
+          "type": "gregor1.MsgID",
+          "name": "id"
+        }
+      ]
+    },
+    {
+      "type": "record",
       "name": "WalletAccountInfo",
       "fields": [
         {
@@ -95,6 +113,14 @@
           "name": "homeTodoItems"
         },
         {
+          "type": "int",
+          "name": "unverifiedEmails"
+        },
+        {
+          "type": "int",
+          "name": "unverifiedPhones"
+        },
+        {
           "type": {
             "type": "array",
             "items": "DeviceID"
@@ -128,6 +154,13 @@
             "items": "string"
           },
           "name": "newTeamNames"
+        },
+        {
+          "type": {
+            "type": "array",
+            "items": "DeletedTeamInfo"
+          },
+          "name": "deletedTeams"
         },
         {
           "type": {

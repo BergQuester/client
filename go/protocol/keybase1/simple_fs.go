@@ -1223,6 +1223,114 @@ func (o SyncConfigAndStatusRes) DeepCopy() SyncConfigAndStatusRes {
 	}
 }
 
+type FSSettings struct {
+	SpaceAvailableNotificationThreshold int64 `codec:"spaceAvailableNotificationThreshold" json:"spaceAvailableNotificationThreshold"`
+}
+
+func (o FSSettings) DeepCopy() FSSettings {
+	return FSSettings{
+		SpaceAvailableNotificationThreshold: o.SpaceAvailableNotificationThreshold,
+	}
+}
+
+type SimpleFSStats struct {
+	ProcessStats      ProcessRuntimeStats `codec:"processStats" json:"processStats"`
+	BlockCacheDbStats []string            `codec:"blockCacheDbStats" json:"blockCacheDbStats"`
+	SyncCacheDbStats  []string            `codec:"syncCacheDbStats" json:"syncCacheDbStats"`
+	RuntimeDbStats    []DbStats           `codec:"runtimeDbStats" json:"runtimeDbStats"`
+}
+
+func (o SimpleFSStats) DeepCopy() SimpleFSStats {
+	return SimpleFSStats{
+		ProcessStats: o.ProcessStats.DeepCopy(),
+		BlockCacheDbStats: (func(x []string) []string {
+			if x == nil {
+				return nil
+			}
+			ret := make([]string, len(x))
+			for i, v := range x {
+				vCopy := v
+				ret[i] = vCopy
+			}
+			return ret
+		})(o.BlockCacheDbStats),
+		SyncCacheDbStats: (func(x []string) []string {
+			if x == nil {
+				return nil
+			}
+			ret := make([]string, len(x))
+			for i, v := range x {
+				vCopy := v
+				ret[i] = vCopy
+			}
+			return ret
+		})(o.SyncCacheDbStats),
+		RuntimeDbStats: (func(x []DbStats) []DbStats {
+			if x == nil {
+				return nil
+			}
+			ret := make([]DbStats, len(x))
+			for i, v := range x {
+				vCopy := v.DeepCopy()
+				ret[i] = vCopy
+			}
+			return ret
+		})(o.RuntimeDbStats),
+	}
+}
+
+type SubscriptionTopic int
+
+const (
+	SubscriptionTopic_FAVORITES      SubscriptionTopic = 0
+	SubscriptionTopic_JOURNAL_STATUS SubscriptionTopic = 1
+)
+
+func (o SubscriptionTopic) DeepCopy() SubscriptionTopic { return o }
+
+var SubscriptionTopicMap = map[string]SubscriptionTopic{
+	"FAVORITES":      0,
+	"JOURNAL_STATUS": 1,
+}
+
+var SubscriptionTopicRevMap = map[SubscriptionTopic]string{
+	0: "FAVORITES",
+	1: "JOURNAL_STATUS",
+}
+
+func (e SubscriptionTopic) String() string {
+	if v, ok := SubscriptionTopicRevMap[e]; ok {
+		return v
+	}
+	return ""
+}
+
+type PathSubscriptionTopic int
+
+const (
+	PathSubscriptionTopic_CHILDREN PathSubscriptionTopic = 0
+	PathSubscriptionTopic_STAT     PathSubscriptionTopic = 1
+)
+
+func (o PathSubscriptionTopic) DeepCopy() PathSubscriptionTopic { return o }
+
+var PathSubscriptionTopicMap = map[string]PathSubscriptionTopic{
+	"CHILDREN": 0,
+	"STAT":     1,
+}
+
+var PathSubscriptionTopicRevMap = map[PathSubscriptionTopic]string{
+	0: "CHILDREN",
+	1: "STAT",
+}
+
+func (e PathSubscriptionTopic) String() string {
+	if v, ok := PathSubscriptionTopicRevMap[e]; ok {
+		return v
+	}
+	return ""
+}
+
 type SimpleFSListArg struct {
 	OpID                OpID       `codec:"opID" json:"opID"`
 	Path                Path       `codec:"path" json:"path"`
@@ -1351,6 +1459,14 @@ type SimpleFSClearConflictStateArg struct {
 	Path Path `codec:"path" json:"path"`
 }
 
+type SimpleFSFinishResolvingConflictArg struct {
+	Path Path `codec:"path" json:"path"`
+}
+
+type SimpleFSForceStuckConflictArg struct {
+	Path Path `codec:"path" json:"path"`
+}
+
 type SimpleFSSyncStatusArg struct {
 	Filter ListFilter `codec:"filter" json:"filter"`
 }
@@ -1394,8 +1510,46 @@ type SimpleFSSyncConfigAndStatusArg struct {
 type SimpleFSAreWeConnectedToMDServerArg struct {
 }
 
+type SimpleFSCheckReachabilityArg struct {
+}
+
 type SimpleFSSetDebugLevelArg struct {
 	Level string `codec:"level" json:"level"`
+}
+
+type SimpleFSSettingsArg struct {
+}
+
+type SimpleFSSetNotificationThresholdArg struct {
+	Threshold int64 `codec:"threshold" json:"threshold"`
+}
+
+type SimpleFSObfuscatePathArg struct {
+	Path Path `codec:"path" json:"path"`
+}
+
+type SimpleFSDeobfuscatePathArg struct {
+	Path Path `codec:"path" json:"path"`
+}
+
+type SimpleFSGetStatsArg struct {
+}
+
+type SimpleFSSubscribePathArg struct {
+	SubscriptionID            string                `codec:"subscriptionID" json:"subscriptionID"`
+	KbfsPath                  string                `codec:"kbfsPath" json:"kbfsPath"`
+	Topic                     PathSubscriptionTopic `codec:"topic" json:"topic"`
+	DeduplicateIntervalSecond int                   `codec:"deduplicateIntervalSecond" json:"deduplicateIntervalSecond"`
+}
+
+type SimpleFSSubscribeNonPathArg struct {
+	SubscriptionID            string            `codec:"subscriptionID" json:"subscriptionID"`
+	Topic                     SubscriptionTopic `codec:"topic" json:"topic"`
+	DeduplicateIntervalSecond int               `codec:"deduplicateIntervalSecond" json:"deduplicateIntervalSecond"`
+}
+
+type SimpleFSUnsubscribeArg struct {
+	SubscriptionID string `codec:"subscriptionID" json:"subscriptionID"`
 }
 
 type SimpleFSInterface interface {
@@ -1466,8 +1620,10 @@ type SimpleFSInterface interface {
 	SimpleFSWait(context.Context, OpID) error
 	// Instructs KBFS to dump debugging info into its logs.
 	SimpleFSDumpDebuggingInfo(context.Context) error
-	// Clear the conflict state of a TLF.
 	SimpleFSClearConflictState(context.Context, Path) error
+	SimpleFSFinishResolvingConflict(context.Context, Path) error
+	// Force a TLF into a stuck conflict state (for testing).
+	SimpleFSForceStuckConflict(context.Context, Path) error
 	// Get sync status.
 	SimpleFSSyncStatus(context.Context, ListFilter) (FSSyncStatus, error)
 	// This RPC generates a random token to be used by a client that needs to
@@ -1508,7 +1664,16 @@ type SimpleFSInterface interface {
 	SimpleFSSetFolderSyncConfig(context.Context, SimpleFSSetFolderSyncConfigArg) error
 	SimpleFSSyncConfigAndStatus(context.Context) (SyncConfigAndStatusRes, error)
 	SimpleFSAreWeConnectedToMDServer(context.Context) (bool, error)
+	SimpleFSCheckReachability(context.Context) error
 	SimpleFSSetDebugLevel(context.Context, string) error
+	SimpleFSSettings(context.Context) (FSSettings, error)
+	SimpleFSSetNotificationThreshold(context.Context, int64) error
+	SimpleFSObfuscatePath(context.Context, Path) (string, error)
+	SimpleFSDeobfuscatePath(context.Context, Path) ([]string, error)
+	SimpleFSGetStats(context.Context) (SimpleFSStats, error)
+	SimpleFSSubscribePath(context.Context, SimpleFSSubscribePathArg) error
+	SimpleFSSubscribeNonPath(context.Context, SimpleFSSubscribeNonPathArg) error
+	SimpleFSUnsubscribe(context.Context, string) error
 }
 
 func SimpleFSProtocol(i SimpleFSInterface) rpc.Protocol {
@@ -1875,6 +2040,36 @@ func SimpleFSProtocol(i SimpleFSInterface) rpc.Protocol {
 					return
 				},
 			},
+			"simpleFSFinishResolvingConflict": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSFinishResolvingConflictArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]SimpleFSFinishResolvingConflictArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]SimpleFSFinishResolvingConflictArg)(nil), args)
+						return
+					}
+					err = i.SimpleFSFinishResolvingConflict(ctx, typedArgs[0].Path)
+					return
+				},
+			},
+			"simpleFSForceStuckConflict": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSForceStuckConflictArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]SimpleFSForceStuckConflictArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]SimpleFSForceStuckConflictArg)(nil), args)
+						return
+					}
+					err = i.SimpleFSForceStuckConflict(ctx, typedArgs[0].Path)
+					return
+				},
+			},
 			"simpleFSSyncStatus": {
 				MakeArg: func() interface{} {
 					var ret [1]SimpleFSSyncStatusArg
@@ -2025,6 +2220,16 @@ func SimpleFSProtocol(i SimpleFSInterface) rpc.Protocol {
 					return
 				},
 			},
+			"simpleFSCheckReachability": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSCheckReachabilityArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					err = i.SimpleFSCheckReachability(ctx)
+					return
+				},
+			},
 			"simpleFSSetDebugLevel": {
 				MakeArg: func() interface{} {
 					var ret [1]SimpleFSSetDebugLevelArg
@@ -2037,6 +2242,116 @@ func SimpleFSProtocol(i SimpleFSInterface) rpc.Protocol {
 						return
 					}
 					err = i.SimpleFSSetDebugLevel(ctx, typedArgs[0].Level)
+					return
+				},
+			},
+			"simpleFSSettings": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSSettingsArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					ret, err = i.SimpleFSSettings(ctx)
+					return
+				},
+			},
+			"simpleFSSetNotificationThreshold": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSSetNotificationThresholdArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]SimpleFSSetNotificationThresholdArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]SimpleFSSetNotificationThresholdArg)(nil), args)
+						return
+					}
+					err = i.SimpleFSSetNotificationThreshold(ctx, typedArgs[0].Threshold)
+					return
+				},
+			},
+			"simpleFSObfuscatePath": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSObfuscatePathArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]SimpleFSObfuscatePathArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]SimpleFSObfuscatePathArg)(nil), args)
+						return
+					}
+					ret, err = i.SimpleFSObfuscatePath(ctx, typedArgs[0].Path)
+					return
+				},
+			},
+			"simpleFSDeobfuscatePath": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSDeobfuscatePathArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]SimpleFSDeobfuscatePathArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]SimpleFSDeobfuscatePathArg)(nil), args)
+						return
+					}
+					ret, err = i.SimpleFSDeobfuscatePath(ctx, typedArgs[0].Path)
+					return
+				},
+			},
+			"simpleFSGetStats": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSGetStatsArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					ret, err = i.SimpleFSGetStats(ctx)
+					return
+				},
+			},
+			"simpleFSSubscribePath": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSSubscribePathArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]SimpleFSSubscribePathArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]SimpleFSSubscribePathArg)(nil), args)
+						return
+					}
+					err = i.SimpleFSSubscribePath(ctx, typedArgs[0])
+					return
+				},
+			},
+			"simpleFSSubscribeNonPath": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSSubscribeNonPathArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]SimpleFSSubscribeNonPathArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]SimpleFSSubscribeNonPathArg)(nil), args)
+						return
+					}
+					err = i.SimpleFSSubscribeNonPath(ctx, typedArgs[0])
+					return
+				},
+			},
+			"simpleFSUnsubscribe": {
+				MakeArg: func() interface{} {
+					var ret [1]SimpleFSUnsubscribeArg
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[1]SimpleFSUnsubscribeArg)
+					if !ok {
+						err = rpc.NewTypeError((*[1]SimpleFSUnsubscribeArg)(nil), args)
+						return
+					}
+					err = i.SimpleFSUnsubscribe(ctx, typedArgs[0].SubscriptionID)
 					return
 				},
 			},
@@ -2217,10 +2532,22 @@ func (c SimpleFSClient) SimpleFSDumpDebuggingInfo(ctx context.Context) (err erro
 	return
 }
 
-// Clear the conflict state of a TLF.
 func (c SimpleFSClient) SimpleFSClearConflictState(ctx context.Context, path Path) (err error) {
 	__arg := SimpleFSClearConflictStateArg{Path: path}
 	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSClearConflictState", []interface{}{__arg}, nil)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSFinishResolvingConflict(ctx context.Context, path Path) (err error) {
+	__arg := SimpleFSFinishResolvingConflictArg{Path: path}
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSFinishResolvingConflict", []interface{}{__arg}, nil)
+	return
+}
+
+// Force a TLF into a stuck conflict state (for testing).
+func (c SimpleFSClient) SimpleFSForceStuckConflict(ctx context.Context, path Path) (err error) {
+	__arg := SimpleFSForceStuckConflictArg{Path: path}
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSForceStuckConflict", []interface{}{__arg}, nil)
 	return
 }
 
@@ -2317,8 +2644,57 @@ func (c SimpleFSClient) SimpleFSAreWeConnectedToMDServer(ctx context.Context) (r
 	return
 }
 
+func (c SimpleFSClient) SimpleFSCheckReachability(ctx context.Context) (err error) {
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSCheckReachability", []interface{}{SimpleFSCheckReachabilityArg{}}, nil)
+	return
+}
+
 func (c SimpleFSClient) SimpleFSSetDebugLevel(ctx context.Context, level string) (err error) {
 	__arg := SimpleFSSetDebugLevelArg{Level: level}
 	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSSetDebugLevel", []interface{}{__arg}, nil)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSSettings(ctx context.Context) (res FSSettings, err error) {
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSSettings", []interface{}{SimpleFSSettingsArg{}}, &res)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSSetNotificationThreshold(ctx context.Context, threshold int64) (err error) {
+	__arg := SimpleFSSetNotificationThresholdArg{Threshold: threshold}
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSSetNotificationThreshold", []interface{}{__arg}, nil)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSObfuscatePath(ctx context.Context, path Path) (res string, err error) {
+	__arg := SimpleFSObfuscatePathArg{Path: path}
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSObfuscatePath", []interface{}{__arg}, &res)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSDeobfuscatePath(ctx context.Context, path Path) (res []string, err error) {
+	__arg := SimpleFSDeobfuscatePathArg{Path: path}
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSDeobfuscatePath", []interface{}{__arg}, &res)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSGetStats(ctx context.Context) (res SimpleFSStats, err error) {
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSGetStats", []interface{}{SimpleFSGetStatsArg{}}, &res)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSSubscribePath(ctx context.Context, __arg SimpleFSSubscribePathArg) (err error) {
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSSubscribePath", []interface{}{__arg}, nil)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSSubscribeNonPath(ctx context.Context, __arg SimpleFSSubscribeNonPathArg) (err error) {
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSSubscribeNonPath", []interface{}{__arg}, nil)
+	return
+}
+
+func (c SimpleFSClient) SimpleFSUnsubscribe(ctx context.Context, subscriptionID string) (err error) {
+	__arg := SimpleFSUnsubscribeArg{SubscriptionID: subscriptionID}
+	err = c.Cli.Call(ctx, "keybase.1.SimpleFS.simpleFSUnsubscribe", []interface{}{__arg}, nil)
 	return
 }

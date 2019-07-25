@@ -11,26 +11,36 @@ import (
 
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/keybase/client/go/libkb"
+	storage "github.com/keybase/client/go/teams/storage"
 	"golang.org/x/net/context"
 
 	"github.com/keybase/client/go/protocol/keybase1"
 )
 
 func ShouldRunBoxAudit(mctx libkb.MetaContext) bool {
-	validSession := mctx.G().ActiveDevice.Valid()
-	if !validSession {
+	if !mctx.G().ActiveDevice.Valid() {
 		mctx.Debug("ShouldRunBoxAudit: not logged in")
+		return false
 	}
-	shouldRun := mctx.G().Env.GetRunMode() == libkb.DevelRunMode ||
-		mctx.G().Env.RunningInCI() ||
-		mctx.G().FeatureFlags.Enabled(mctx, libkb.FeatureBoxAuditor)
-	if !shouldRun {
-		mctx.Debug("ShouldRunBoxAudit: determined should not run")
+
+	if mctx.G().IsMobileAppType() {
+		netState := mctx.G().MobileNetState.State()
+		if netState.IsLimited() {
+			mctx.Debug("ShouldRunBoxAudit: skipping box audit, network state: %v", netState)
+			return false
+		}
+		appState, stateMtime := mctx.G().MobileAppState.StateAndMtime()
+		mctx.Debug("ShouldRunBoxAudit: mobileAppState=%+v, stateMtime=%+v", appState, stateMtime)
+		if stateMtime == nil || appState != keybase1.MobileAppState_FOREGROUND || time.Now().Sub(*stateMtime) < 3*time.Minute {
+			mctx.Debug("ShouldRunBoxAudit: mobile and backgrounded")
+			return false
+		}
 	}
-	return validSession && shouldRun
+
+	return mctx.G().Env.GetRunMode() == libkb.DevelRunMode || mctx.G().Env.RunningInCI() || mctx.G().FeatureFlags.Enabled(mctx, libkb.FeatureBoxAuditor)
 }
 
-const CurrentBoxAuditVersion Version = 5
+const CurrentBoxAuditVersion boxAuditVersion = 6
 const JailLRUSize = 100
 const BoxAuditIDLen = 16
 const MaxBoxAuditRetryAttempts = 6
@@ -92,10 +102,10 @@ func VerifyBoxAudit(mctx libkb.MetaContext, teamID keybase1.TeamID) (newMctx lib
 // encrypted (which is somewhat trivial, since members can leak the secret if
 // they want regardless of server cooperation).
 type BoxAuditor struct {
-	Version Version
+	Version boxAuditVersion
 
 	// Singleflight lock on team ID.
-	locktab libkb.LockTable
+	locktab *libkb.LockTable
 
 	// jailMutex and queueMutex are not per-team locks, since they are
 	// collections of multiple team IDs.  Two audits of two teams can happen at
@@ -143,7 +153,14 @@ func (a *BoxAuditor) OnDbNuke(mctx libkb.MetaContext) error {
 }
 
 func NewBoxAuditor(g *libkb.GlobalContext) *BoxAuditor {
-	a := &BoxAuditor{Version: CurrentBoxAuditVersion}
+	return newBoxAuditorWithVersion(g, CurrentBoxAuditVersion)
+}
+
+func newBoxAuditorWithVersion(g *libkb.GlobalContext, version boxAuditVersion) *BoxAuditor {
+	a := &BoxAuditor{
+		Version: version,
+		locktab: libkb.NewLockTable(),
+	}
 	a.resetJailLRU()
 	return a
 }
@@ -202,6 +219,7 @@ func (a *BoxAuditor) boxAuditTeamLocked(mctx libkb.MetaContext, teamID keybase1.
 	isRetry := log.InProgress
 	rotateBeforeAudit := isRetry && !mctx.G().TestOptions.NoAutorotateOnBoxAuditRetry
 	attempt := a.attemptLocked(mctx, teamID, rotateBeforeAudit, false)
+
 	var id BoxAuditID
 	if isRetry {
 		// If there's already an inprogress Audit (i.e., previous failure and
@@ -304,13 +322,13 @@ func (a *BoxAuditor) AssertUnjailedOrReaudit(mctx libkb.MetaContext, teamID keyb
 	for i := 0; i <= maxRetries; i++ {
 		_, err = a.BoxAuditTeam(mctx, teamID)
 		if err != nil {
-			mctx.Debug("AssertUnjailedOrReaudit: box audit try #%d failed...")
+			mctx.Debug("AssertUnjailedOrReaudit: box audit try #%d failed...", i+1)
 			errs = append(errs, err)
 		} else {
 			return true, nil
 		}
 	}
-	return false, fmt.Errorf("failed to successfully reaudit team in box audit jail after %d retries: %s", maxRetries, libkb.CombineErrors(errs...))
+	return false, fmt.Errorf("failed to successfully reaudit team %s in box audit jail after %d retries: %s", teamID, maxRetries, libkb.CombineErrors(errs...))
 }
 
 // RetryNextBoxAudit selects a teamID from the box audit retry queue and performs another box audit.
@@ -435,20 +453,6 @@ func (a *BoxAuditor) attemptLocked(mctx libkb.MetaContext, teamID keybase1.TeamI
 		return attempt
 	}
 
-	if rotateBeforeAudit {
-		mctx.Debug("rotating before audit")
-		err := team.Rotate(mctx.Ctx())
-		if err != nil {
-			attempt.Error = getErrorMessage(fmt.Errorf("failed to rotate team before audit: %s", err))
-			return attempt
-		}
-		return a.attemptLocked(mctx, teamID, false, true)
-	}
-
-	if justRotated {
-		attempt.Rotated = true
-	}
-
 	g := team.Generation()
 	attempt.Generation = &g
 
@@ -461,6 +465,22 @@ func (a *BoxAuditor) attemptLocked(mctx libkb.MetaContext, teamID keybase1.TeamI
 		mctx.Debug("Not attempting box audit attempt; %s", attempt.Result)
 		attempt.Result = *shouldAuditResult
 		return attempt
+	}
+
+	if rotateBeforeAudit {
+		mctx.Debug("rotating before audit")
+		err := team.Rotate(mctx.Ctx(), keybase1.RotationType_VISIBLE)
+		if err != nil {
+			mctx.Warning("failed to rotate team before audit: %s", err)
+			// continue despite having failed to rotate
+		} else {
+			// reload the team
+			return a.attemptLocked(mctx, teamID, false, true)
+		}
+	}
+
+	if justRotated {
+		attempt.Rotated = true
 	}
 
 	pastSummary, err := calculateChainSummary(mctx, team)
@@ -663,16 +683,16 @@ type BoxAuditLog struct {
 	// Whether the last Audit is still in progress; false initially.
 	InProgress bool
 
-	Version Version
+	Version boxAuditVersion
 }
 
-var _ Versioned = &BoxAuditLog{}
+var _ boxAuditVersioned = &BoxAuditLog{}
 
-func (l *BoxAuditLog) GetVersion() Version {
+func (l *BoxAuditLog) getVersion() boxAuditVersion {
 	return l.Version
 }
 
-func NewBoxAuditLog(version Version) *BoxAuditLog {
+func NewBoxAuditLog(version boxAuditVersion) *BoxAuditLog {
 	return &BoxAuditLog{
 		Audits:     nil,
 		InProgress: false,
@@ -709,16 +729,16 @@ func NewBoxAuditID() (BoxAuditID, error) {
 // from the queue.
 type BoxAuditQueue struct {
 	Items   []BoxAuditQueueItem
-	Version Version
+	Version boxAuditVersion
 }
 
-var _ Versioned = &BoxAuditQueue{}
+var _ boxAuditVersioned = &BoxAuditQueue{}
 
-func (q *BoxAuditQueue) GetVersion() Version {
+func (q *BoxAuditQueue) getVersion() boxAuditVersion {
 	return q.Version
 }
 
-func NewBoxAuditQueue(version Version) *BoxAuditQueue {
+func NewBoxAuditQueue(version boxAuditVersion) *BoxAuditQueue {
 	return &BoxAuditQueue{
 		Items:   nil,
 		Version: version,
@@ -736,16 +756,16 @@ type BoxAuditQueueItem struct {
 // unless they are explicitly loaded by the fast or slow team loaders.
 type BoxAuditJail struct {
 	TeamIDs map[keybase1.TeamID]bool
-	Version Version
+	Version boxAuditVersion
 }
 
-var _ Versioned = &BoxAuditJail{}
+var _ boxAuditVersioned = &BoxAuditJail{}
 
-func (j *BoxAuditJail) GetVersion() Version {
+func (j *BoxAuditJail) getVersion() boxAuditVersion {
 	return j.Version
 }
 
-func NewBoxAuditJail(version Version) *BoxAuditJail {
+func NewBoxAuditJail(version boxAuditVersion) *BoxAuditJail {
 	return &BoxAuditJail{
 		TeamIDs: make(map[keybase1.TeamID]bool),
 		Version: version,
@@ -861,6 +881,11 @@ func calculateChainSummary(mctx libkb.MetaContext, team *Team) (summary *boxPubl
 	if err != nil {
 		return nil, err
 	}
+
+	if !mctx.G().GetMerkleClient().CanExamineHistoricalRoot(mctx, merkleSeqno) {
+		return nil, fmt.Errorf("last rotation was at %d, before the most recent checkpoint, so forcing a rotation", merkleSeqno)
+	}
+
 	return calculateSummaryAtMerkleSeqno(mctx, team, merkleSeqno, true)
 }
 
@@ -984,7 +1009,7 @@ func calculateSummaryAtMerkleSeqno(mctx libkb.MetaContext, team *Team, merkleSeq
 
 // merkleSeqnoAtGenerationInception assumes TeamSigChainState.MerkleRoots is populated
 func merkleSeqnoAtGenerationInception(mctx libkb.MetaContext, teamchain *TeamSigChainState) (merkleSeqno keybase1.Seqno, err error) {
-	ptk, err := teamchain.GetLatestPerTeamKey()
+	ptk, err := teamchain.GetLatestPerTeamKey(mctx)
 	if err != nil {
 		return 0, err
 	}
@@ -1000,7 +1025,7 @@ func keySetToTeamIDs(dbKeySet libkb.DBKeySet) ([]keybase1.TeamID, error) {
 	seen := make(map[keybase1.TeamID]bool)
 	teamIDs := make([]keybase1.TeamID, 0, len(dbKeySet))
 	for dbKey := range dbKeySet {
-		teamID, err := ParseTeamIDDBKey(dbKey.Key)
+		teamID, err := storage.ParseTeamIDDBKey(dbKey.Key)
 		if err != nil {
 			return nil, err
 		}
@@ -1013,26 +1038,26 @@ func keySetToTeamIDs(dbKeySet libkb.DBKeySet) ([]keybase1.TeamID, error) {
 	return teamIDs, nil
 }
 
-type Version int
-type Versioned interface {
-	GetVersion() Version
+type boxAuditVersion int
+type boxAuditVersioned interface {
+	getVersion() boxAuditVersion
 }
 
-func BoxAuditLogDbKey(teamID keybase1.TeamID) libkb.DbKey {
-	return libkb.DbKey{Typ: libkb.DBBoxAuditor, Key: string(teamID)}
+func BoxAuditLogDbKey(mctx libkb.MetaContext, teamID keybase1.TeamID) libkb.DbKey {
+	return libkb.DbKey{Typ: libkb.DBBoxAuditor, Key: string(teamID) + mctx.ActiveDevice().UID().String()}
 }
 
-func BoxAuditQueueDbKey() libkb.DbKey {
-	return libkb.DbKey{Typ: libkb.DBBoxAuditorPermanent, Key: "queue"}
+func BoxAuditQueueDbKey(mctx libkb.MetaContext) libkb.DbKey {
+	return libkb.DbKey{Typ: libkb.DBBoxAuditorPermanent, Key: "queue" + mctx.ActiveDevice().UID().String()}
 }
 
-func BoxAuditJailDbKey() libkb.DbKey {
-	return libkb.DbKey{Typ: libkb.DBBoxAuditorPermanent, Key: "jail"}
+func BoxAuditJailDbKey(mctx libkb.MetaContext) libkb.DbKey {
+	return libkb.DbKey{Typ: libkb.DBBoxAuditorPermanent, Key: "jail" + mctx.ActiveDevice().UID().String()}
 }
 
 func (a *BoxAuditor) maybeGetLog(mctx libkb.MetaContext, teamID keybase1.TeamID) (*BoxAuditLog, error) {
 	var log BoxAuditLog
-	found, err := a.maybeGetIntoVersioned(mctx, &log, BoxAuditLogDbKey(teamID))
+	found, err := a.maybeGetIntoVersioned(mctx, &log, BoxAuditLogDbKey(mctx, teamID))
 	if err != nil || !found {
 		return nil, err
 	}
@@ -1041,7 +1066,7 @@ func (a *BoxAuditor) maybeGetLog(mctx libkb.MetaContext, teamID keybase1.TeamID)
 
 func (a *BoxAuditor) maybeGetQueue(mctx libkb.MetaContext) (*BoxAuditQueue, error) {
 	var queue BoxAuditQueue
-	found, err := a.maybeGetIntoVersioned(mctx, &queue, BoxAuditQueueDbKey())
+	found, err := a.maybeGetIntoVersioned(mctx, &queue, BoxAuditQueueDbKey(mctx))
 	if err != nil || !found {
 		return nil, err
 	}
@@ -1050,14 +1075,14 @@ func (a *BoxAuditor) maybeGetQueue(mctx libkb.MetaContext) (*BoxAuditQueue, erro
 
 func (a *BoxAuditor) maybeGetJail(mctx libkb.MetaContext) (*BoxAuditJail, error) {
 	var jail BoxAuditJail
-	found, err := a.maybeGetIntoVersioned(mctx, &jail, BoxAuditJailDbKey())
+	found, err := a.maybeGetIntoVersioned(mctx, &jail, BoxAuditJailDbKey(mctx))
 	if err != nil || !found {
 		return nil, err
 	}
 	return &jail, nil
 }
 
-func (a *BoxAuditor) maybeGetIntoVersioned(mctx libkb.MetaContext, v Versioned, dbKey libkb.DbKey) (found bool, err error) {
+func (a *BoxAuditor) maybeGetIntoVersioned(mctx libkb.MetaContext, v boxAuditVersioned, dbKey libkb.DbKey) (found bool, err error) {
 	defer mctx.TraceTimed("maybeGetIntoVersioned", func() error { return err })()
 	found, err = mctx.G().LocalDb.GetInto(v, dbKey)
 	if err != nil {
@@ -1068,8 +1093,8 @@ func (a *BoxAuditor) maybeGetIntoVersioned(mctx libkb.MetaContext, v Versioned, 
 	if !found {
 		return false, nil
 	}
-	if v.GetVersion() != a.Version {
-		mctx.Debug("Not returning outdated obj at version %d (now at version %d)", v.GetVersion(), a.Version)
+	if v.getVersion() != a.Version {
+		mctx.Debug("Not returning outdated obj at version %d (now at version %d)", v.getVersion(), a.Version)
 		// We do not delete the old data.
 		return false, nil
 	}
@@ -1077,15 +1102,15 @@ func (a *BoxAuditor) maybeGetIntoVersioned(mctx libkb.MetaContext, v Versioned, 
 }
 
 func putLogToDisk(mctx libkb.MetaContext, log *BoxAuditLog, teamID keybase1.TeamID) error {
-	return putToDisk(mctx, BoxAuditLogDbKey(teamID), log)
+	return putToDisk(mctx, BoxAuditLogDbKey(mctx, teamID), log)
 }
 
 func putQueueToDisk(mctx libkb.MetaContext, queue *BoxAuditQueue) error {
-	return putToDisk(mctx, BoxAuditQueueDbKey(), queue)
+	return putToDisk(mctx, BoxAuditQueueDbKey(mctx), queue)
 }
 
 func putJailToDisk(mctx libkb.MetaContext, jail *BoxAuditJail) error {
-	return putToDisk(mctx, BoxAuditJailDbKey(), jail)
+	return putToDisk(mctx, BoxAuditJailDbKey(mctx), jail)
 }
 
 func putToDisk(mctx libkb.MetaContext, dbKey libkb.DbKey, i interface{}) error {

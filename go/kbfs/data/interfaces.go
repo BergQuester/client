@@ -214,6 +214,8 @@ type BlockPutState interface {
 		ctx context.Context, blockPtr BlockPointer, block Block,
 		readyBlockData ReadyBlockData, syncedCb func() error) error
 	SaveOldPtr(ctx context.Context, oldPtr BlockPointer) error
+	Ptrs() []BlockPointer
+	GetBlock(ctx context.Context, blockPtr BlockPointer) (Block, error)
 }
 
 // DirtyBlockCacheSimple is a bare-bones interface for a dirty block
@@ -303,4 +305,11 @@ type DirtyBlockCache interface {
 	// Shutdown frees any resources associated with this instance.  It
 	// returns an error if there are any unsynced blocks.
 	Shutdown() error
+}
+
+// Obfuscator can transform a given plaintext string into a
+// securely-obfuscated, but still human-readable, string.
+type Obfuscator interface {
+	// Obfuscate returns an obfuscated version of `plaintext`.
+	Obfuscate(plaintext string) string
 }

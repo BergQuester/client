@@ -35,7 +35,7 @@ import (
 // conflict resolution
 type CtxCRTagKey int
 
-type failModeForTest int
+type failModeForTesting int
 
 const (
 	// CtxCRIDKey is the type of the tag for unique operation IDs
@@ -63,7 +63,7 @@ const (
 	// we should give up.
 	maxConflictResolutionAttempts = 10
 
-	alwaysFailCR failModeForTest = iota
+	alwaysFailCR failModeForTesting = iota
 	doNotAlwaysFailCR
 )
 
@@ -72,8 +72,8 @@ const (
 var ErrTooManyCRAttempts = errors.New(
 	"too many attempts at conflict resolution on this TLF")
 
-// ErrCRFailForTest indicates that CR is disabled for a test.
-var ErrCRFailForTest = errors.New(
+// ErrCRFailForTesting indicates that CR is disabled for a test.
+var ErrCRFailForTesting = errors.New(
 	"conflict resolution failed because test requested it")
 
 // CtxCROpID is the display name for the unique operation
@@ -109,7 +109,8 @@ type ConflictResolver struct {
 	lockNextTime  bool
 	canceledCount int
 
-	failModeForTest failModeForTest
+	failModeLock       sync.RWMutex
+	failModeForTesting failModeForTesting
 }
 
 // NewConflictResolver constructs a new ConflictResolver (and launches
@@ -488,7 +489,7 @@ func (cr *ConflictResolver) makeChains(ctx context.Context,
 	// If there are no new merged changes, don't make any merged
 	// chains.
 	if len(merged) == 0 {
-		return unmergedChains, newCRChainsEmpty(), nil
+		return unmergedChains, newCRChainsEmpty(nil), nil
 	}
 
 	mergedChains, err = newCRChainsForIRMDs(
@@ -582,8 +583,9 @@ func (cr *ConflictResolver) createdFileWithNonzeroSizes(
 	mergedPath := data.Path{
 		FolderBranch: mergedCop.getFinalPath().FolderBranch,
 		Path: []data.PathNode{
-			{BlockPointer: mergedChain.mostRecent, Name: ""},
-			{BlockPointer: data.ZeroPtr, Name: mergedCop.NewName},
+			{BlockPointer: mergedChain.mostRecent,
+				Name: data.NewPathPartString("", nil)},
+			{BlockPointer: data.ZeroPtr, Name: mergedCop.obfuscatedNewName()},
 		},
 	}
 	kmd := mergedChains.mostRecentChainMDInfo
@@ -598,8 +600,9 @@ func (cr *ConflictResolver) createdFileWithNonzeroSizes(
 	unmergedPath := data.Path{
 		FolderBranch: mergedCop.getFinalPath().FolderBranch,
 		Path: []data.PathNode{
-			{BlockPointer: unmergedChain.mostRecent, Name: ""},
-			{BlockPointer: data.ZeroPtr, Name: mergedCop.NewName},
+			{BlockPointer: unmergedChain.mostRecent,
+				Name: data.NewPathPartString("", nil)},
+			{BlockPointer: data.ZeroPtr, Name: mergedCop.obfuscatedNewName()},
 		},
 	}
 	unmergedEntry, err := cr.fbo.blocks.GetEntry(ctx, lState, kmd, unmergedPath)
@@ -713,7 +716,9 @@ func (cr *ConflictResolver) checkPathForMerge(ctx context.Context,
 			return nil, fmt.Errorf("Change original (%v -> %v) didn't work",
 				unmergedOriginal, mergedOriginal)
 		}
-		newPath := unmergedPath.ChildPath(cop.NewName, unmergedChain.mostRecent)
+		newPath := unmergedPath.ChildPath(
+			cop.obfuscatedNewName(), unmergedChain.mostRecent,
+			unmergedChain.obfuscator)
 		if cop.Type == data.Dir {
 			// recurse for this chain
 			newPaths, err := cr.checkPathForMerge(ctx, unmergedChain, newPath,
@@ -925,7 +930,7 @@ func (cr *ConflictResolver) resolveMergedPathTail(ctx context.Context,
 		if err != nil {
 			return data.Path{}, data.BlockPointer{}, nil, err
 		}
-		co, err := newCreateOp(name, parentOriginal, de.Type)
+		co, err := newCreateOp(name.Plaintext(), parentOriginal, de.Type)
 		if err != nil {
 			return data.Path{}, data.BlockPointer{}, nil, err
 		}
@@ -1041,7 +1046,8 @@ func (cr *ConflictResolver) resolveMergedPathTail(ctx context.Context,
 			}
 			mostRecent = mostRecentParent
 			// update the name for this renamed node
-			mergedPath.Path[len(mergedPath.Path)-1].Name = newName
+			mergedPath.Path[len(mergedPath.Path)-1].Name =
+				data.NewPathPartString(newName, mergedPath.Obfuscator())
 			break
 		}
 	}
@@ -1197,6 +1203,7 @@ func (cr *ConflictResolver) resolveMergedPaths(ctx context.Context,
 	}
 
 	mergedNodeCache := newNodeCacheStandard(cr.fbo.folderBranch)
+	mergedNodeCache.SetObfuscatorMaker(cr.fbo.makeObfuscator)
 	nodeMap, _, err := cr.fbo.blocks.SearchForNodes(
 		ctx, mergedNodeCache, ptrs, newPtrs,
 		mergedChains.mostRecentChainMDInfo,
@@ -1493,7 +1500,8 @@ outer:
 					invertCreate)
 			}
 			cr.log.CDebugf(ctx, "Putting new merged rename info "+
-				"%v -> %v (symPath: %v)", ptr, newInfo, symPath)
+				"%v -> %v (symPath: %v)", ptr, newInfo,
+				data.NewPathPartString(symPath, chain.obfuscator))
 			mergedChains.renamedOriginals[ptr] = newInfo
 
 			// Fix up the corresponding rmOp to make sure
@@ -1541,7 +1549,7 @@ func (cr *ConflictResolver) getSingleUnmergedPath(
 	data.Path, error) {
 	// Reuse some code by creating a new chains object
 	// consisting of only this node.
-	newChains := newCRChainsEmpty()
+	newChains := newCRChainsEmpty(cr.fbo.makeObfuscator)
 	newChains.byOriginal[chain.original] = chain
 	newChains.byMostRecent[chain.mostRecent] = chain
 	// Fake out the rest of the chains to populate newPtrs.
@@ -1552,6 +1560,7 @@ func (cr *ConflictResolver) getSingleUnmergedPath(
 		newChain := &crChain{
 			original:   c.original,
 			mostRecent: c.mostRecent,
+			obfuscator: newChains.makeObfuscator(),
 		}
 		newChains.byOriginal[c.original] = newChain
 		newChains.byMostRecent[c.mostRecent] = newChain
@@ -1633,7 +1642,10 @@ func (cr *ConflictResolver) fixRenameConflicts(ctx context.Context,
 		if crConflictCheckQuick(unmergedChain, mergedChain) {
 			cr.log.CDebugf(ctx, "File that was renamed on the unmerged "+
 				"branch from %s -> %s has conflicting edits, forking "+
-				"(original ptr %v)", info.oldName, info.newName, ptr)
+				"(original ptr %v)",
+				data.NewPathPartString(info.oldName, unmergedChain.obfuscator),
+				data.NewPathPartString(info.newName, unmergedChain.obfuscator),
+				ptr)
 			oldParent := unmergedChains.byOriginal[info.originalOldParent]
 			for _, op := range oldParent.ops {
 				ro, ok := op.(*rmOp)
@@ -1750,8 +1762,8 @@ func (cr *ConflictResolver) fixRenameConflicts(ctx context.Context,
 			// since this createOp must have been created
 			// as part of conflict resolution.
 			symPath := "./" + strings.Repeat("../", walkBack)
-			cr.log.CDebugf(ctx, "Creating symlink %s at "+
-				"merged path %s", symPath, mergedPath)
+			cr.log.CDebugf(ctx, "Creating symlink %s at merged path %s",
+				data.NewPathPartString(symPath, chain.obfuscator), mergedPath)
 
 			err = cr.convertCreateIntoSymlinkOrCopy(ctx, ptr, info, chain,
 				unmergedChains, mergedChains, symPath)
@@ -1819,7 +1831,10 @@ func (cr *ConflictResolver) fixRenameConflicts(ctx context.Context,
 		if crConflictCheckQuick(unmergedChain, mergedChain) {
 			cr.log.CDebugf(ctx, "File that was renamed on the merged "+
 				"branch from %s -> %s has conflicting edits, forking "+
-				"(original ptr %v)", info.oldName, info.newName, ptr)
+				"(original ptr %v)",
+				data.NewPathPartString(info.oldName, unmergedChain.obfuscator),
+				data.NewPathPartString(info.newName, unmergedChain.obfuscator),
+				ptr)
 			var unmergedParentPath data.Path
 			for _, op := range unmergedChain.ops {
 				switch realOp := op.(type) {
@@ -1844,11 +1859,13 @@ func (cr *ConflictResolver) fixRenameConflicts(ctx context.Context,
 					if err != nil {
 						return nil, err
 					}
+					oldPPS := data.NewPathPartString(
+						info.oldName, unmergedParentPath.Obfuscator())
 					forkedFromMergedRenames[mergedParent] =
 						append(forkedFromMergedRenames[mergedParent],
 							data.PathNode{
 								BlockPointer: unmergedChain.mostRecent,
-								Name:         info.oldName,
+								Name:         oldPPS,
 							})
 					newUnmergedPaths =
 						append(newUnmergedPaths, unmergedParentPath)
@@ -1879,6 +1896,7 @@ func (cr *ConflictResolver) fixRenameConflicts(ctx context.Context,
 	}
 
 	mergedNodeCache := newNodeCacheStandard(cr.fbo.folderBranch)
+	mergedNodeCache.SetObfuscatorMaker(cr.fbo.makeObfuscator)
 	nodeMap, _, err := cr.fbo.blocks.SearchForNodes(
 		ctx, mergedNodeCache, ptrs, newPtrs,
 		mergedChains.mostRecentChainMDInfo,
@@ -1958,7 +1976,7 @@ func (cr *ConflictResolver) fixRenameConflicts(ctx context.Context,
 		// Move up directories starting from beyond the common parent,
 		// to right before the actual node.
 		for i := newParentStart + 1; i < len(mergedPathNewParent.Path)-1; i++ {
-			symPath += mergedPathNewParent.Path[i].Name + "/"
+			symPath += mergedPathNewParent.Path[i].Name.Plaintext() + "/"
 		}
 		symPath += mergedInfo.newName
 
@@ -1980,7 +1998,7 @@ func (cr *ConflictResolver) fixRenameConflicts(ctx context.Context,
 		mergedPathNewParent := mergedNodeCache.PathFromNode(node)
 		for _, pNode := range pathNodes {
 			mergedPath := mergedPathNewParent.ChildPath(
-				pNode.Name, pNode.BlockPointer)
+				pNode.Name, pNode.BlockPointer, cr.fbo.makeObfuscator())
 			mergedPaths[pNode.BlockPointer] = mergedPath
 		}
 	}
@@ -2069,6 +2087,7 @@ func (cr *ConflictResolver) addMergedRecreates(ctx context.Context,
 					}
 					co.AddRefBlock(c.mostRecent)
 					co.setWriterInfo(mostRecentMergedWriterInfo)
+					chain.ensurePath(co, chain.mostRecent)
 					chain.ops = append([]op{co}, chain.ops...)
 					cr.log.CDebugf(ctx, "Re-created rm'd merge-modified node "+
 						"%v with operation %s in parent %v", unrefOriginal, co,
@@ -2280,12 +2299,15 @@ func (cr *ConflictResolver) computeActions(ctx context.Context,
 }
 
 func (cr *ConflictResolver) makeFileBlockDeepCopy(ctx context.Context,
-	lState *kbfssync.LockState, chains *crChains, mergedMostRecent data.BlockPointer,
-	parentPath data.Path, name string, ptr data.BlockPointer, blocks fileBlockMap,
+	lState *kbfssync.LockState, chains *crChains,
+	mergedMostRecent data.BlockPointer, parentPath data.Path,
+	name data.PathPartString, ptr data.BlockPointer, blocks fileBlockMap,
 	dirtyBcache data.DirtyBlockCacheSimple) (data.BlockPointer, error) {
 	kmd := chains.mostRecentChainMDInfo
 
-	file := parentPath.ChildPath(name, ptr)
+	// Use a `nil` childObfuscator here, since this is for a file and
+	// files can't have children to obfuscate, by defintion.
+	file := parentPath.ChildPath(name, ptr, nil)
 	oldInfos, err := cr.fbo.blocks.getIndirectFileBlockInfosLocked(
 		ctx, lState, kmd, file)
 	if err != nil {
@@ -2325,7 +2347,7 @@ func (cr *ConflictResolver) makeFileBlockDeepCopy(ctx context.Context,
 		}
 	}
 
-	err = blocks.putTopBlock(ctx, mergedMostRecent, name, fblock)
+	err = blocks.putTopBlock(ctx, mergedMostRecent, name.Plaintext(), fblock)
 	if err != nil {
 		return data.BlockPointer{}, err
 	}
@@ -2429,13 +2451,15 @@ func (cr *ConflictResolver) doOneAction(
 
 		// Any file block copies, keyed by their new temporary block
 		// IDs, and later we will ready them.
-		unmergedFetcher := func(ctx context.Context, name string,
+		unmergedFetcher := func(
+			ctx context.Context, name data.PathPartString,
 			ptr data.BlockPointer) (data.BlockPointer, error) {
 			return cr.makeFileBlockDeepCopy(ctx, lState, unmergedChains,
 				mergedPath.TailPointer(), unmergedPath, name, ptr,
 				newFileBlocks, dirtyBcache)
 		}
-		mergedFetcher := func(ctx context.Context, name string,
+		mergedFetcher := func(
+			ctx context.Context, name data.PathPartString,
 			ptr data.BlockPointer) (data.BlockPointer, error) {
 			return cr.makeFileBlockDeepCopy(ctx, lState, mergedChains,
 				mergedPath.TailPointer(), mergedPath, name,
@@ -2445,6 +2469,13 @@ func (cr *ConflictResolver) doOneAction(
 		// Execute each action and save the modified ops back into
 		// each chain.
 		for _, action := range actions {
+			// Make sure we don't get stuck inside a large action list
+			// for a long time, if the actions are slow to complete.
+			err := cr.checkDone(ctx)
+			if err != nil {
+				return err
+			}
+
 			swap, newPtr, err := action.swapUnmergedBlock(
 				ctx, unmergedChains, mergedChains, unmergedDir)
 			if err != nil {
@@ -2490,6 +2521,13 @@ func (cr *ConflictResolver) doOneAction(
 	// Now update the ops related to this exact path (not the ops
 	// for its parent!).
 	for _, action := range actions {
+		// Make sure we don't get stuck inside a large action list
+		// for a long time, if the actions are slow to complete.
+		err := cr.checkDone(ctx)
+		if err != nil {
+			return err
+		}
+
 		// unmergedMostRecent is for the correct pointer, but
 		// mergedPath may be for the parent in the case of files
 		// so we need to find the real mergedMostRecent pointer.
@@ -2499,7 +2537,7 @@ func (cr *ConflictResolver) doOneAction(
 			mergedMostRecent = mergedChain.mostRecent
 		}
 
-		err := action.updateOps(
+		err = action.updateOps(
 			ctx, unmergedMostRecent, mergedMostRecent,
 			unmergedDir, mergedDir, unmergedChains, mergedChains)
 		if err != nil {
@@ -2535,7 +2573,14 @@ func (cr *ConflictResolver) doActions(ctx context.Context,
 	// in standard Merkle-tree-fashion.
 	doneActions := make(map[data.BlockPointer]bool)
 	for _, unmergedPath := range unmergedPaths {
-		err := cr.doOneAction(
+		// Make sure we don't get stuck inside a large unmerged list for
+		// a long time, if the actions are slow to complete.
+		err := cr.checkDone(ctx)
+		if err != nil {
+			return err
+		}
+
+		err = cr.doOneAction(
 			ctx, lState, unmergedChains, mergedChains, unmergedPath,
 			mergedPaths, chargedTo, actionMap, dbm, doneActions, newFileBlocks,
 			dirtyBcache)
@@ -2622,7 +2667,8 @@ func (cr *ConflictResolver) makeRevertedOps(ctx context.Context,
 
 						err = cr.addChildBlocksIfIndirectFile(ctx, lState,
 							chains, cop.getFinalPath().ChildPath(
-								cop.NewName, renameMostRecent), op)
+								cop.obfuscatedNewName(), renameMostRecent,
+								cr.fbo.makeObfuscator()), op)
 						if err != nil {
 							return nil, err
 						}
@@ -2640,6 +2686,7 @@ func (cr *ConflictResolver) makeRevertedOps(ctx context.Context,
 					if err != nil {
 						return nil, err
 					}
+					chain.ensurePath(rop, chain.mostRecent)
 					// Set the Dir.Ref fields to be the same as the Unref
 					// -- they will be fixed up later.
 					rop.AddSelfUpdate(ri.originalOldParent)
@@ -2809,7 +2856,7 @@ func (cr *ConflictResolver) resolveOnePath(ctx context.Context,
 	resolvedPath, ok := mergedPaths[unmergedMostRecent]
 	if !ok {
 		var ptrsToAppend []data.BlockPointer
-		var namesToAppend []string
+		var namesToAppend []data.PathPartString
 		next := unmergedMostRecent
 		for len(mergedPaths[next].Path) == 0 {
 			newPtrs := make(map[data.BlockPointer]bool)
@@ -2837,7 +2884,8 @@ func (cr *ConflictResolver) resolveOnePath(ctx context.Context,
 		}
 		resolvedPath = mergedPaths[next]
 		for i, ptr := range ptrsToAppend {
-			resolvedPath = resolvedPath.ChildPath(namesToAppend[i], ptr)
+			resolvedPath = resolvedPath.ChildPath(
+				namesToAppend[i], ptr, cr.fbo.makeObfuscator())
 		}
 	}
 
@@ -2879,7 +2927,9 @@ func (cr *ConflictResolver) resolveOnePath(ctx context.Context,
 		copy(newResolvedPath.Path[:len(parentPath.Path)], parentPath.Path)
 		copy(newResolvedPath.Path[len(parentPath.Path):], resolvedPath.Path[i:])
 		i = len(parentPath.Path) - 1
-		newResolvedPath.Path[i+1].Name = newName
+		newNamePPS := data.NewPathPartString(
+			newName, newResolvedPath.Obfuscator())
+		newResolvedPath.Path[i+1].Name = newNamePPS
 		resolvedPath = newResolvedPath
 	}
 
@@ -3042,6 +3092,7 @@ func (cr *ConflictResolver) getOpsForLocalNotification(ctx context.Context,
 	// We need to get the complete set of updated merged paths, so
 	// that we can correctly order the chains from the root outward.
 	mergedNodeCache := newNodeCacheStandard(cr.fbo.folderBranch)
+	mergedNodeCache.SetObfuscatorMaker(cr.fbo.makeObfuscator)
 	nodeMap, _, err := cr.fbo.blocks.SearchForNodes(
 		ctx, mergedNodeCache, ptrs, newPtrs,
 		md, md.data.Dir.BlockPointer)
@@ -3223,6 +3274,9 @@ type conflictRecord struct {
 
 func getAndDeserializeConflicts(config Config, db *LevelDb,
 	key []byte) ([]conflictRecord, error) {
+	if db == nil {
+		return nil, errors.New("No conflict DB given")
+	}
 	conflictsSoFarSerialized, err := db.Get(key, nil)
 	var conflictsSoFar []conflictRecord
 	switch errors.Cause(err) {
@@ -3241,6 +3295,10 @@ func getAndDeserializeConflicts(config Config, db *LevelDb,
 
 func serializeAndPutConflicts(config Config, db *LevelDb,
 	key []byte, conflicts []conflictRecord) error {
+	if db == nil {
+		return errors.New("No conflict DB given")
+	}
+
 	conflictsSerialized, err := config.Codec().Encode(conflicts)
 	if err != nil {
 		return err
@@ -3248,18 +3306,42 @@ func serializeAndPutConflicts(config Config, db *LevelDb,
 	return db.Put(key, conflictsSerialized, nil)
 }
 
-func (cr *ConflictResolver) recordStartResolve(ci conflictInput) error {
-	db := cr.config.GetConflictResolutionDB()
-	if db == nil {
-		return errNoCRDB
+func isCRStuckFromRecords(conflictsSoFar []conflictRecord) bool {
+	// If we're exactly at the threshold, make sure the last attempt
+	// has completed.
+	if len(conflictsSoFar) == maxConflictResolutionAttempts+1 {
+		return !conflictsSoFar[len(conflictsSoFar)-1].ErrorTime.IsZero()
 	}
-	key := cr.fbo.id().Bytes()
-	conflictsSoFar, err := getAndDeserializeConflicts(cr.config, db, key)
+	return len(conflictsSoFar) > maxConflictResolutionAttempts
+}
+
+func (cr *ConflictResolver) isStuckWithDbAndConflicts() (
+	db *LevelDb, key []byte, conflictsSoFar []conflictRecord, isStuck bool,
+	err error) {
+	db = cr.config.GetConflictResolutionDB()
+	if db == nil {
+		return nil, nil, nil, false, errNoCRDB
+	}
+	key = cr.fbo.id().Bytes()
+	conflictsSoFar, err = getAndDeserializeConflicts(cr.config, db, key)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+
+	return db, key, conflictsSoFar, isCRStuckFromRecords(conflictsSoFar), nil
+}
+
+func (cr *ConflictResolver) isStuck() (bool, error) {
+	_, _, _, isStuck, err := cr.isStuckWithDbAndConflicts()
+	return isStuck, err
+}
+
+func (cr *ConflictResolver) recordStartResolve(ci conflictInput) error {
+	db, key, conflictsSoFar, isStuck, err := cr.isStuckWithDbAndConflicts()
 	if err != nil {
 		return err
 	}
-
-	if len(conflictsSoFar) > maxConflictResolutionAttempts {
+	if isStuck {
 		return ErrTooManyCRAttempts
 	}
 	conflictsSoFar = append(conflictsSoFar, conflictRecord{
@@ -3279,12 +3361,11 @@ func (cr *ConflictResolver) recordStartResolve(ci conflictInput) error {
 func (cr *ConflictResolver) recordFinishResolve(
 	ctx context.Context, ci conflictInput,
 	panicVar interface{}, receivedErr error) {
-	db := cr.config.GetConflictResolutionDB()
-	if db == nil {
-		cr.log.CWarningf(ctx, "could not record CR result to nil DB")
+	db, key, _, wasStuck, err := cr.isStuckWithDbAndConflicts()
+	if err != nil {
+		cr.log.CWarningf(ctx, "could not record CR result: %+v", err)
 		return
 	}
-	key := cr.fbo.id().Bytes()
 
 	// If we neither errored nor panicked, this CR succeeded and we can wipe
 	// the DB entry.
@@ -3295,10 +3376,13 @@ func (cr *ConflictResolver) recordFinishResolve(
 			cr.log.CWarningf(ctx,
 				"Could not record conflict resolution success: %v", err)
 		}
+
+		if wasStuck {
+			cr.config.Reporter().NotifyFavoritesChanged(ctx)
+		}
 		return
 	}
 
-	var err error
 	defer func() {
 		// If we can't record the failure to the CR DB, at least log it.
 		if err != nil {
@@ -3331,6 +3415,15 @@ func (cr *ConflictResolver) recordFinishResolve(
 	}
 
 	err = serializeAndPutConflicts(cr.config, db, key, conflictsSoFar)
+	if err != nil {
+		cr.log.CWarningf(ctx,
+			"Could not record conflict resolution success: %+v", err)
+		return
+	}
+
+	if !wasStuck && isCRStuckFromRecords(conflictsSoFar) {
+		cr.config.Reporter().NotifyFavoritesChanged(ctx)
+	}
 }
 
 func (cr *ConflictResolver) makeDiskBlockCache(ctx context.Context) (
@@ -3359,7 +3452,7 @@ func (cr *ConflictResolver) makeDiskBlockCache(ctx context.Context) (
 			}
 		}
 		dbc, err = newDiskBlockCacheLocal(
-			cr.config, crDirtyBlockCacheLimitTrackerType, tempDir)
+			cr.config, crDirtyBlockCacheLimitTrackerType, tempDir, cr.config.Mode())
 		if err != nil {
 			dirCleanupFn(ctx)
 			return nil, nil, err
@@ -3379,6 +3472,18 @@ func (cr *ConflictResolver) makeDiskBlockCache(ctx context.Context) (
 	}
 
 	return dbc, cleanupFn, nil
+}
+
+func (cr *ConflictResolver) getFailModeForTesting() failModeForTesting {
+	cr.failModeLock.RLock()
+	defer cr.failModeLock.RUnlock()
+	return cr.failModeForTesting
+}
+
+func (cr *ConflictResolver) setFailModeForTesting(mode failModeForTesting) {
+	cr.failModeLock.Lock()
+	defer cr.failModeLock.Unlock()
+	cr.failModeForTesting = mode
 }
 
 // CRWrapError wraps an error that happens during conflict resolution.
@@ -3450,8 +3555,8 @@ func (cr *ConflictResolver) doResolve(ctx context.Context, ci conflictInput) {
 		return
 	}
 
-	if cr.failModeForTest == alwaysFailCR {
-		err = ErrCRFailForTest
+	if cr.getFailModeForTesting() == alwaysFailCR {
+		err = ErrCRFailForTesting
 		return
 	}
 
@@ -3665,18 +3770,26 @@ func (cr *ConflictResolver) doResolve(ctx context.Context, ci conflictInput) {
 	// to clean up the quota anyway . . .)
 }
 
-func (cr *ConflictResolver) clearConflictRecords() error {
-	db := cr.config.GetConflictResolutionDB()
-	if db == nil {
-		return errNoCRDB
+func (cr *ConflictResolver) clearConflictRecords(ctx context.Context) error {
+	db, key, _, wasStuck, err := cr.isStuckWithDbAndConflicts()
+	if err != nil {
+		return err
 	}
-	key := cr.fbo.id().Bytes()
-	return db.Delete(key, nil)
+
+	err = db.Delete(key, nil)
+	if err != nil {
+		return err
+	}
+
+	if wasStuck {
+		cr.config.Reporter().NotifyFavoritesChanged(ctx)
+	}
+	return nil
 }
 
 func openCRDBInternal(config Config) (*LevelDb, error) {
 	if config.IsTestMode() {
-		return openLevelDB(storage.NewMemStorage())
+		return openLevelDB(storage.NewMemStorage(), config.Mode())
 	}
 	err := os.MkdirAll(sysPath.Join(config.StorageRoot(),
 		conflictResolverRecordsDir, conflictResolverRecordsVersionString),
@@ -3693,7 +3806,7 @@ func openCRDBInternal(config Config) (*LevelDb, error) {
 		return nil, err
 	}
 
-	return openLevelDB(stor)
+	return openLevelDB(stor, config.Mode())
 }
 
 func openCRDB(config Config) (db *LevelDb) {

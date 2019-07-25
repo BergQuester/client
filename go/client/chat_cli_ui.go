@@ -352,6 +352,26 @@ func (c *ChatCLIUI) ChatCommandMarkdown(ctx context.Context, arg chat1.ChatComma
 	return nil
 }
 
-func (c *ChatCLIUI) ChatTeamMentionUpdate(ctx context.Context, arg chat1.ChatTeamMentionUpdateArg) error {
+func (c *ChatCLIUI) ChatMaybeMentionUpdate(ctx context.Context, arg chat1.ChatMaybeMentionUpdateArg) error {
+	return nil
+}
+
+func (c *ChatCLIUI) ChatLoadGalleryHit(ctx context.Context, arg chat1.ChatLoadGalleryHitArg) error {
+	return nil
+}
+
+func (c *ChatCLIUI) ChatWatchPosition(context.Context, chat1.ChatWatchPositionArg) (chat1.LocationWatchID, error) {
+	return chat1.LocationWatchID(0), nil
+}
+
+func (c *ChatCLIUI) ChatClearWatch(context.Context, chat1.ChatClearWatchArg) error {
+	return nil
+}
+
+func (c *ChatCLIUI) ChatCommandStatus(context.Context, chat1.ChatCommandStatusArg) error {
+	return nil
+}
+
+func (c *ChatCLIUI) ChatBotCommandsUpdateStatus(context.Context, chat1.ChatBotCommandsUpdateStatusArg) error {
 	return nil
 }

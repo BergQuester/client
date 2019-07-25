@@ -19,9 +19,6 @@ import (
 const (
 	// idByteLen is the number of bytes in a top-level folder ID
 	idByteLen = 16
-	// idStringLen is the number of characters in the string
-	// representation of a top-level folder ID
-	idStringLen = 2 * idByteLen
 	// idSuffix is the last byte of a private top-level folder ID
 	idSuffix = 0x16
 	// pubIDSuffix is the last byte of a public top-level folder ID
@@ -65,6 +62,11 @@ func (t Type) String() string {
 	default:
 		return fmt.Sprintf("Unknown TLF type: %d", t)
 	}
+}
+
+// MarshalText implements the encoding.TextMarshaler interface for Type.
+func (t Type) MarshalText() ([]byte, error) {
+	return []byte(t.String()), nil
 }
 
 // PathString returns the string representation of t, when they are used in a

@@ -136,7 +136,7 @@ func (r *ResolverImpl) resolve(m MetaContext, input string, withBody bool) (res 
 	defer m.TraceTimed(fmt.Sprintf("Resolving username %q", input), func() error { return res.err })()
 
 	var au AssertionURL
-	if au, res.err = ParseAssertionURL(m.G().MakeAssertionContext(), input, false); res.err != nil {
+	if au, res.err = ParseAssertionURL(m.G().MakeAssertionContext(m), input, false); res.err != nil {
 		return res
 	}
 	res = r.resolveURL(m, au, input, withBody, false)
@@ -172,7 +172,7 @@ func (r *ResolverImpl) resolveFullExpression(m MetaContext, input string, withBo
 	defer m.VTrace(VLog1, fmt.Sprintf("Resolver#resolveFullExpression(%q)", input), func() error { return res.err })()
 
 	var expr AssertionExpression
-	expr, res.err = AssertionParseAndOnly(m.G().MakeAssertionContext(), input)
+	expr, res.err = AssertionParseAndOnly(m.G().MakeAssertionContext(m), input)
 	if res.err != nil {
 		return res
 	}
@@ -522,7 +522,7 @@ type ResolveCacheStats struct {
 type ResolverImpl struct {
 	cache   *ramcache.Ramcache
 	Stats   *ResolveCacheStats
-	locktab LockTable
+	locktab *LockTable
 }
 
 func (s *ResolveCacheStats) Eq(m, t, mt, et, h int) bool {
@@ -593,8 +593,9 @@ func (s *ResolveCacheStats) IncDiskPuts() {
 
 func NewResolverImpl() *ResolverImpl {
 	return &ResolverImpl{
-		cache: nil,
-		Stats: &ResolveCacheStats{},
+		cache:   nil,
+		locktab: NewLockTable(),
+		Stats:   &ResolveCacheStats{},
 	}
 }
 
@@ -719,7 +720,7 @@ func (r *ResolverImpl) CacheTeamResolution(m MetaContext, id keybase1.TeamID, na
 
 func (r *ResolverImpl) PurgeResolveCache(m MetaContext, input string) (err error) {
 	defer m.Trace(fmt.Sprintf("Resolver#PurgeResolveCache(input = %q)", input), func() error { return err })()
-	expr, err := AssertionParseAndOnly(m.G().MakeAssertionContext(), input)
+	expr, err := AssertionParseAndOnly(m.G().MakeAssertionContext(m), input)
 	if err != nil {
 		return err
 	}

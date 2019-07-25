@@ -71,8 +71,8 @@ func (cache *diskBlockCacheWrapped) enableCache(
 			cache.config, typ)
 	} else {
 		cacheStorageRoot := filepath.Join(cache.storageRoot, cacheFolder)
-		*cachePtr, err = newDiskBlockCacheLocal(cache.config, typ,
-			cacheStorageRoot)
+		*cachePtr, err = newDiskBlockCacheLocal(
+			cache.config, typ, cacheStorageRoot, mode)
 	}
 	return err
 }
@@ -114,14 +114,14 @@ func (cache *diskBlockCacheWrapped) getCacheLocked(
 // DoesCacheHaveSpace implements the DiskBlockCache interface for
 // diskBlockCacheWrapped.
 func (cache *diskBlockCacheWrapped) DoesCacheHaveSpace(
-	ctx context.Context, cacheType DiskBlockCacheType) (bool, error) {
+	ctx context.Context, cacheType DiskBlockCacheType) (bool, int64, error) {
 	cache.mtx.RLock()
 	defer cache.mtx.RUnlock()
 	c, err := cache.getCacheLocked(cacheType)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return c.DoesCacheHaveSpace(ctx), nil
+	return c.DoesCacheHaveSpace(ctx)
 }
 
 // IsSyncCacheEnabled returns true if the sync cache is enabled.

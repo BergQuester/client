@@ -34,16 +34,20 @@ func (t *testBlockMetadataStoreConfig) MakeLogger(
 func (t *testBlockMetadataStoreConfig) StorageRoot() string {
 	return t.storageRoot
 }
+func (t *testBlockMetadataStoreConfig) Mode() InitMode {
+	return modeTest{modeDefault{}}
+}
 
 func makeBlockMetadataStoreForTest(t *testing.T) (
 	blockMetadataStore BlockMetadataStore, tempdir string) {
 	tempdir, err := ioutil.TempDir(os.TempDir(), "xattr_test")
+	require.NoError(t, err)
 	config := testBlockMetadataStoreConfig{
 		codec:       kbfscodec.NewMsgpack(),
 		log:         logger.NewTestLogger(t),
 		storageRoot: tempdir,
 	}
-	s, err := newDiskBlockMetadataStore(&config)
+	s, err := newDiskBlockMetadataStore(&config, modeTest{modeDefault{}})
 	require.NoError(t, err)
 	return s, tempdir
 }

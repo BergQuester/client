@@ -13,17 +13,33 @@ import (
 	"github.com/keybase/client/go/protocol/chat1"
 	"github.com/keybase/client/go/protocol/gregor1"
 	"github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/client/go/teambot"
 	"github.com/keybase/client/go/teams"
 	context "golang.org/x/net/context"
 )
 
-func getTeamCryptKey(ctx context.Context, team *teams.Team, generation keybase1.PerTeamKeyGeneration,
-	public, kbfsEncrypted bool) (res types.CryptKey, err error) {
+func getTeamCryptKey(mctx libkb.MetaContext, team *teams.Team, generation keybase1.PerTeamKeyGeneration,
+	public, kbfsEncrypted bool, botUID *gregor1.UID, forEncryption bool) (res types.CryptKey, err error) {
 	if public {
 		return publicCryptKey, nil
 	}
+
+	if teambot.CurrentUserIsBot(mctx, botUID) {
+		if kbfsEncrypted {
+			return res, fmt.Errorf("TeambotKeys not supported by KBFS")
+		}
+		keyer := mctx.G().GetTeambotBotKeyer()
+		if forEncryption {
+			return keyer.GetLatestTeambotKey(mctx, team.ID)
+		}
+		return keyer.GetTeambotKeyAtGeneration(mctx, team.ID, keybase1.TeambotKeyGeneration(generation))
+	}
+
 	if kbfsEncrypted {
-		kbfsKeys := team.KBFSCryptKeys(ctx, keybase1.TeamApplication_CHAT)
+		if botUID != nil {
+			return res, fmt.Errorf("TeambotKeys not supported by KBFS")
+		}
+		kbfsKeys := team.KBFSCryptKeys(mctx.Ctx(), keybase1.TeamApplication_CHAT)
 		for _, key := range kbfsKeys {
 			if key.Generation() == int(generation) {
 				return key, nil
@@ -31,7 +47,19 @@ func getTeamCryptKey(ctx context.Context, team *teams.Team, generation keybase1.
 		}
 		return res, NewDecryptionKeyNotFoundError(int(generation), kbfsEncrypted, public)
 	}
-	return team.ApplicationKeyAtGeneration(ctx, keybase1.TeamApplication_CHAT, generation)
+
+	appKey, err := team.ChatKeyAtGeneration(mctx.Ctx(), generation)
+	if err != nil {
+		return res, err
+	}
+
+	// Need to convert this key in to a TeambotKey
+	if botUID != nil {
+		res, _, err = mctx.G().GetTeambotMemberKeyer().GetOrCreateTeambotKey(
+			mctx, team.ID, *botUID, appKey)
+		return res, err
+	}
+	return appKey, nil
 }
 
 // shouldFallbackToSlowLoadAfterFTLError returns trues if the given error should result
@@ -342,14 +370,15 @@ func (t *TeamsNameInfoSource) AllCryptKeys(ctx context.Context, name string, pub
 }
 
 func (t *TeamsNameInfoSource) EncryptionKey(ctx context.Context, name string, teamID chat1.TLFID,
-	membersType chat1.ConversationMembersType, public bool) (res types.CryptKey, ni types.NameInfo, err error) {
+	membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID) (res types.CryptKey, ni types.NameInfo, err error) {
 	defer t.Trace(ctx, func() error { return err },
-		fmt.Sprintf("EncryptionKeys(%s,%s,%v)", name, teamID, public))()
+		fmt.Sprintf("EncryptionKey(%s,%s,%v,%v)", name, teamID, public, botUID))()
 
-	m := libkb.NewMetaContext(ctx, t.G().ExternalG())
-	if !public && membersType == chat1.ConversationMembersType_TEAM && m.G().FeatureFlags.Enabled(m, libkb.FeatureFTL) {
-		res, ni, err = encryptionKeyViaFTL(m, name, teamID)
-		if shouldFallbackToSlowLoadAfterFTLError(m, err) {
+	mctx := libkb.NewMetaContext(ctx, t.G().ExternalG())
+	if !teambot.CurrentUserIsBot(mctx, botUID) && !public && membersType == chat1.ConversationMembersType_TEAM &&
+		mctx.G().FeatureFlags.Enabled(mctx, libkb.FeatureFTL) {
+		res, ni, err = encryptionKeyViaFTL(mctx, name, teamID)
+		if shouldFallbackToSlowLoadAfterFTLError(mctx, err) {
 			// Some FTL errors should not kill the whole operation; let's
 			// clear them out and allow regular, slow loading to happen.
 			// This is basically a server-side kill switch for some versions
@@ -364,9 +393,11 @@ func (t *TeamsNameInfoSource) EncryptionKey(ctx context.Context, name string, te
 	if err != nil {
 		return res, ni, err
 	}
-	if res, err = getTeamCryptKey(ctx, team, team.Generation(), public, false); err != nil {
+	if res, err = getTeamCryptKey(mctx, team, team.Generation(), public, false, /* kbfsEncrypted */
+		botUID, true /* forEncryption */); err != nil {
 		return res, ni, err
 	}
+
 	tlfID, err := chat1.TeamIDToTLFID(team.ID)
 	if err != nil {
 		return res, ni, err
@@ -379,15 +410,17 @@ func (t *TeamsNameInfoSource) EncryptionKey(ctx context.Context, name string, te
 
 func (t *TeamsNameInfoSource) DecryptionKey(ctx context.Context, name string, teamID chat1.TLFID,
 	membersType chat1.ConversationMembersType, public bool,
-	keyGeneration int, kbfsEncrypted bool) (res types.CryptKey, err error) {
+	keyGeneration int, kbfsEncrypted bool, botUID *gregor1.UID) (res types.CryptKey, err error) {
 	defer t.Trace(ctx, func() error { return err },
-		fmt.Sprintf("DecryptionKeys(%s,%s,%v,%d,%v)", name, teamID, public, keyGeneration, kbfsEncrypted))()
+		fmt.Sprintf("DecryptionKey(%s,%s,%v,%d,%v,%v)", name, teamID, public,
+			keyGeneration, kbfsEncrypted, botUID))()
 
-	m := libkb.NewMetaContext(ctx, t.G().ExternalG())
-	if !kbfsEncrypted && !public && membersType == chat1.ConversationMembersType_TEAM &&
-		m.G().FeatureFlags.Enabled(m, libkb.FeatureFTL) {
-		res, err = decryptionKeyViaFTL(m, teamID, keyGeneration)
-		if shouldFallbackToSlowLoadAfterFTLError(m, err) {
+	mctx := libkb.NewMetaContext(ctx, t.G().ExternalG())
+	if !teambot.CurrentUserIsBot(mctx, botUID) && !kbfsEncrypted && !public &&
+		membersType == chat1.ConversationMembersType_TEAM &&
+		mctx.G().FeatureFlags.Enabled(mctx, libkb.FeatureFTL) {
+		res, err = decryptionKeyViaFTL(mctx, teamID, keyGeneration)
+		if shouldFallbackToSlowLoadAfterFTLError(mctx, err) {
 			// See comment above in EncryptionKey()
 			err = nil
 		} else {
@@ -400,34 +433,41 @@ func (t *TeamsNameInfoSource) DecryptionKey(ctx context.Context, name string, te
 	if err != nil {
 		return res, err
 	}
-	return getTeamCryptKey(ctx, team, keybase1.PerTeamKeyGeneration(keyGeneration), public,
-		kbfsEncrypted)
+	return getTeamCryptKey(mctx, team, keybase1.PerTeamKeyGeneration(keyGeneration), public,
+		kbfsEncrypted, botUID, false /* forEncryption */)
 }
 
 func (t *TeamsNameInfoSource) EphemeralEncryptionKey(mctx libkb.MetaContext, tlfName string, tlfID chat1.TLFID,
-	membersType chat1.ConversationMembersType, public bool) (teamEK keybase1.TeamEk, err error) {
+	membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID) (ek types.EphemeralCryptKey, err error) {
 	if public {
-		return teamEK, NewPublicTeamEphemeralKeyError()
+		return ek, NewPublicTeamEphemeralKeyError()
 	}
 
 	teamID, err := keybase1.TeamIDFromString(tlfID.String())
 	if err != nil {
-		return teamEK, err
+		return ek, err
 	}
-	teamEK, _, err = t.G().GetEKLib().GetOrCreateLatestTeamEK(mctx, teamID)
-	return teamEK, err
+	if botUID != nil {
+		ek, _, err = t.G().GetEKLib().GetOrCreateLatestTeambotEK(mctx, teamID, *botUID)
+	} else {
+		ek, _, err = t.G().GetEKLib().GetOrCreateLatestTeamEK(mctx, teamID)
+	}
+	return ek, err
 }
 
 func (t *TeamsNameInfoSource) EphemeralDecryptionKey(mctx libkb.MetaContext, tlfName string, tlfID chat1.TLFID,
-	membersType chat1.ConversationMembersType, public bool,
-	generation keybase1.EkGeneration, contentCtime *gregor1.Time) (teamEK keybase1.TeamEk, err error) {
+	membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID,
+	generation keybase1.EkGeneration, contentCtime *gregor1.Time) (ek types.EphemeralCryptKey, err error) {
 	if public {
-		return teamEK, NewPublicTeamEphemeralKeyError()
+		return ek, NewPublicTeamEphemeralKeyError()
 	}
 
 	teamID, err := keybase1.TeamIDFromString(tlfID.String())
 	if err != nil {
-		return teamEK, err
+		return ek, err
+	}
+	if botUID != nil {
+		return t.G().GetEKLib().GetTeambotEK(mctx, teamID, *botUID, generation, contentCtime)
 	}
 	return t.G().GetEKLib().GetTeamEK(mctx, teamID, generation, contentCtime)
 }
@@ -526,41 +566,63 @@ func NewImplicitTeamsNameInfoSource(g *globals.Context, lookupUpgraded bool) *Im
 	}
 }
 
-func (t *ImplicitTeamsNameInfoSource) identify(ctx context.Context, tlfID chat1.TLFID,
-	impTeamName keybase1.ImplicitTeamDisplayName) (res []keybase1.TLFIdentifyFailure, err error) {
+type identifyFailure struct {
+	Msg string
+}
 
+// Identify participants of a conv.
+// Returns as if all IDs succeeded if ctx is in TLFIdentifyBehavior_CHAT_GUI mode.
+func (t *ImplicitTeamsNameInfoSource) identify(ctx context.Context, team *teams.Team, impTeamName keybase1.ImplicitTeamDisplayName) (err error) {
 	var names []string
 	names = append(names, impTeamName.Writers.KeybaseUsers...)
 	names = append(names, impTeamName.Readers.KeybaseUsers...)
 
 	// identify the members in the conversation
 	identBehavior, _, ok := globals.CtxIdentifyMode(ctx)
+	defer t.Trace(ctx, func() error { return err }, fmt.Sprintf("identify(%s, %v)", impTeamName.String(), identBehavior))()
 	if !ok {
-		return res, errors.New("invalid context with no chat metadata")
+		return errors.New("invalid context with no chat metadata")
 	}
 	cb := make(chan struct{})
 	go func(ctx context.Context) {
-		res, err = t.Identify(ctx, names, true,
+		var idFails []keybase1.TLFIdentifyFailure
+		idFails, err = t.Identify(ctx, names, true,
 			func() keybase1.TLFID {
-				return keybase1.TLFID(tlfID.String())
+				return keybase1.TLFID(team.ID.String())
 			},
 			func() keybase1.CanonicalTlfName {
 				return keybase1.CanonicalTlfName(impTeamName.String())
 			})
+		if err != nil || len(idFails) > 0 {
+			t.Debug(ctx, "identify failed err=%v fails=%+v", err, idFails)
+		}
+		// ignore idFails
 		close(cb)
 	}(globals.BackgroundChatCtx(ctx, t.G()))
 	switch identBehavior {
 	case keybase1.TLFIdentifyBehavior_CHAT_GUI:
-		// For GUI mode, let's just let this identify roll in the background. We will be sending up
+		// For GUI mode, let the full IDs roll in the background. We will be sending up
 		// tracker breaks to the UI out of band with whatever chat operation has invoked us here.
-		return nil, nil
+
+		// CORE-10522 peg breaks will need to block sending for non-gui mode too.
+		//            Peg breaks could count as track breaks for real Identify.
+		//            That could nicely cover other applications besides chat. But the UI
+		//            for fixing track breaks doesn't quite make sense for peg breaks.
+
+		// But check reset-pegs on the critical path.
+		for _, uv := range team.AllUserVersions(ctx) {
+			err = t.G().Pegboard.CheckUV(t.MetaContext(ctx), uv)
+			if err != nil {
+				// Turn peg failures into identify failures
+				t.Debug(ctx, "pegboard rejected %v: %v", uv, err)
+				return fmt.Errorf("A user may have reset: %v", err)
+			}
+		}
+		return nil
 	default:
 		<-cb
-		if err != nil {
-			return res, err
-		}
+		return err
 	}
-	return res, nil
 }
 
 func (t *ImplicitTeamsNameInfoSource) transformTeamDoesNotExist(ctx context.Context, err error, name string) error {
@@ -645,9 +707,10 @@ func (t *ImplicitTeamsNameInfoSource) AllCryptKeys(ctx context.Context, name str
 }
 
 func (t *ImplicitTeamsNameInfoSource) EncryptionKey(ctx context.Context, name string, teamID chat1.TLFID,
-	membersType chat1.ConversationMembersType, public bool) (res types.CryptKey, ni types.NameInfo, err error) {
+	membersType chat1.ConversationMembersType, public bool,
+	botUID *gregor1.UID) (res types.CryptKey, ni types.NameInfo, err error) {
 	defer t.Trace(ctx, func() error { return err },
-		fmt.Sprintf("EncryptionKey(%s,%s,%v)", name, teamID, public))()
+		fmt.Sprintf("EncryptionKey(%s,%s,%v,%v)", name, teamID, public, botUID))()
 	team, err := t.loader.loadTeam(ctx, teamID, name, membersType, public, nil)
 	if err != nil {
 		return res, ni, err
@@ -656,10 +719,12 @@ func (t *ImplicitTeamsNameInfoSource) EncryptionKey(ctx context.Context, name st
 	if err != nil {
 		return res, ni, err
 	}
-	if _, err := t.identify(ctx, teamID, impTeamName); err != nil {
+	if err := t.identify(ctx, team, impTeamName); err != nil {
 		return res, ni, err
 	}
-	if res, err = getTeamCryptKey(ctx, team, team.Generation(), public, false); err != nil {
+	mctx := libkb.NewMetaContext(ctx, t.G().ExternalG())
+	if res, err = getTeamCryptKey(mctx, team, team.Generation(), public, false, /* kbfsEncrypted */
+		botUID, true /* forEncryption */); err != nil {
 		return res, ni, err
 	}
 	return res, types.NameInfo{
@@ -670,9 +735,9 @@ func (t *ImplicitTeamsNameInfoSource) EncryptionKey(ctx context.Context, name st
 
 func (t *ImplicitTeamsNameInfoSource) DecryptionKey(ctx context.Context, name string, teamID chat1.TLFID,
 	membersType chat1.ConversationMembersType, public bool,
-	keyGeneration int, kbfsEncrypted bool) (res types.CryptKey, err error) {
+	keyGeneration int, kbfsEncrypted bool, botUID *gregor1.UID) (res types.CryptKey, err error) {
 	defer t.Trace(ctx, func() error { return err },
-		fmt.Sprintf("DecryptionKey(%s,%s,%v,%d,%v)", name, teamID, public, keyGeneration, kbfsEncrypted))()
+		fmt.Sprintf("DecryptionKey(%s,%s,%v,%d,%v,%v)", name, teamID, public, keyGeneration, kbfsEncrypted, botUID))()
 	team, err := loadTeamForDecryption(ctx, t.loader, name, teamID, membersType, public,
 		keyGeneration, kbfsEncrypted)
 	if err != nil {
@@ -682,14 +747,15 @@ func (t *ImplicitTeamsNameInfoSource) DecryptionKey(ctx context.Context, name st
 	if err != nil {
 		return res, err
 	}
-	if _, err = t.identify(ctx, teamID, impTeamName); err != nil {
+	if err := t.identify(ctx, team, impTeamName); err != nil {
 		return res, err
 	}
-	return getTeamCryptKey(ctx, team, keybase1.PerTeamKeyGeneration(keyGeneration), public,
-		kbfsEncrypted)
+	mctx := libkb.NewMetaContext(ctx, t.G().ExternalG())
+	return getTeamCryptKey(mctx, team, keybase1.PerTeamKeyGeneration(keyGeneration), public,
+		kbfsEncrypted, botUID, false /* forEncryption */)
 }
 
-func (t *ImplicitTeamsNameInfoSource) ephemeralLoadAndIdentify(ctx context.Context, tlfName string, tlfID chat1.TLFID,
+func (t *ImplicitTeamsNameInfoSource) ephemeralLoadAndIdentify(ctx context.Context, encrypting bool, tlfName string, tlfID chat1.TLFID,
 	membersType chat1.ConversationMembersType, public bool) (teamID keybase1.TeamID, err error) {
 	if public {
 		return teamID, NewPublicTeamEphemeralKeyError()
@@ -702,28 +768,35 @@ func (t *ImplicitTeamsNameInfoSource) ephemeralLoadAndIdentify(ctx context.Conte
 	if err != nil {
 		return teamID, err
 	}
-	if _, err := t.identify(ctx, tlfID, impTeamName); err != nil {
+	if err := t.identify(ctx, team, impTeamName); err != nil {
 		return teamID, err
 	}
 	return team.ID, nil
 }
 
 func (t *ImplicitTeamsNameInfoSource) EphemeralEncryptionKey(mctx libkb.MetaContext, tlfName string, tlfID chat1.TLFID,
-	membersType chat1.ConversationMembersType, public bool) (teamEK keybase1.TeamEk, err error) {
-	teamID, err := t.ephemeralLoadAndIdentify(mctx.Ctx(), tlfName, tlfID, membersType, public)
+	membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID) (ek types.EphemeralCryptKey, err error) {
+	teamID, err := t.ephemeralLoadAndIdentify(mctx.Ctx(), true, tlfName, tlfID, membersType, public)
 	if err != nil {
-		return teamEK, err
+		return ek, err
 	}
-	teamEK, _, err = t.G().GetEKLib().GetOrCreateLatestTeamEK(mctx, teamID)
-	return teamEK, err
+	if botUID != nil {
+		ek, _, err = t.G().GetEKLib().GetOrCreateLatestTeambotEK(mctx, teamID, *botUID)
+	} else {
+		ek, _, err = t.G().GetEKLib().GetOrCreateLatestTeamEK(mctx, teamID)
+	}
+	return ek, err
 }
 
 func (t *ImplicitTeamsNameInfoSource) EphemeralDecryptionKey(mctx libkb.MetaContext, tlfName string, tlfID chat1.TLFID,
-	membersType chat1.ConversationMembersType, public bool,
-	generation keybase1.EkGeneration, contentCtime *gregor1.Time) (teamEK keybase1.TeamEk, err error) {
-	teamID, err := t.ephemeralLoadAndIdentify(mctx.Ctx(), tlfName, tlfID, membersType, public)
+	membersType chat1.ConversationMembersType, public bool, botUID *gregor1.UID,
+	generation keybase1.EkGeneration, contentCtime *gregor1.Time) (teamEK types.EphemeralCryptKey, err error) {
+	teamID, err := t.ephemeralLoadAndIdentify(mctx.Ctx(), false, tlfName, tlfID, membersType, public)
 	if err != nil {
 		return teamEK, err
+	}
+	if botUID != nil {
+		return t.G().GetEKLib().GetTeambotEK(mctx, teamID, *botUID, generation, contentCtime)
 	}
 	return t.G().GetEKLib().GetTeamEK(mctx, teamID, generation, contentCtime)
 }

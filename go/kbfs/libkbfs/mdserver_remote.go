@@ -6,7 +6,6 @@ package libkbfs
 
 import (
 	"fmt"
-	"net"
 	"sync"
 	"time"
 
@@ -48,6 +47,7 @@ const (
 
 // MDServerRemote is an implementation of the MDServer interface.
 type MDServerRemote struct {
+	kbCtx         Context
 	config        Config
 	log           traceLogger
 	deferLog      traceLogger
@@ -94,11 +94,12 @@ var _ kbfscrypto.AuthTokenRefreshHandler = (*MDServerRemote)(nil)
 var _ rpc.ConnectionHandler = (*MDServerRemote)(nil)
 
 // NewMDServerRemote returns a new instance of MDServerRemote.
-func NewMDServerRemote(config Config, srvRemote rpc.Remote,
+func NewMDServerRemote(kbCtx Context, config Config, srvRemote rpc.Remote,
 	rpcLogFactory rpc.LogFactory) *MDServerRemote {
 	log := config.MakeLogger("")
 	deferLog := log.CloneWithAddedDepth(1)
 	mdServer := &MDServerRemote{
+		kbCtx:         kbCtx,
 		config:        config,
 		observers:     make(map[tlf.ID]chan<- error),
 		log:           traceLogger{log},
@@ -158,30 +159,38 @@ func (md *MDServerRemote) initNewConnection() {
 		md.conn.Shutdown()
 	}
 
-	md.conn = rpc.NewTLSConnection(md.mdSrvRemote, kbfscrypto.GetRootCerts(
+	md.conn = rpc.NewTLSConnectionWithDialable(md.mdSrvRemote, kbfscrypto.GetRootCerts(
 		md.mdSrvRemote.Peek(), libkb.GetBundledCAsFromHost),
 		kbfsmd.ServerErrorUnwrapper{}, md, md.rpcLogFactory,
 		logger.LogOutputWithDepthAdder{Logger: md.config.MakeLogger("")},
-		rpc.DefaultMaxFrameLength, md.connOpts)
+		rpc.DefaultMaxFrameLength, md.connOpts,
+		libkb.NewProxyDialable(md.kbCtx.GetEnv()))
 	md.client = keybase1.MetadataClient{Cli: md.conn.GetClient()}
 }
 
-const reconnectTimeout = 30 * time.Second
+const reconnectTimeout = 10 * time.Second
 
-func (md *MDServerRemote) reconnect() error {
+func (md *MDServerRemote) reconnectContext(ctx context.Context) error {
 	md.connMu.Lock()
 	defer md.connMu.Unlock()
 
 	if md.conn != nil {
-		ctx, cancel := context.WithTimeout(
-			context.Background(), reconnectTimeout)
-		defer cancel()
+		_, hasDeadline := ctx.Deadline()
+		if !hasDeadline {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, reconnectTimeout)
+			defer cancel()
+		}
+
 		return md.conn.ForceReconnect(ctx)
 	}
 
 	md.initNewConnection()
 	return nil
+}
 
+func (md *MDServerRemote) reconnect() error {
+	return md.reconnectContext(context.Background())
 }
 
 // RemoteAddress returns the remote mdserver this client is talking to
@@ -460,20 +469,24 @@ func (md *MDServerRemote) ShouldRetryOnConnect(err error) bool {
 
 // CheckReachability implements the MDServer interface.
 func (md *MDServerRemote) CheckReachability(ctx context.Context) {
-	conn, err := net.DialTimeout("tcp",
+	conn, err := libkb.ProxyDialTimeout(md.kbCtx.GetEnv(), "tcp",
 		// The peeked address is the top choice in most cases.
 		md.mdSrvRemote.Peek(), MdServerPingTimeout)
 	if err != nil {
 		if md.getIsAuthenticated() {
 			md.log.CInfof(ctx, "MDServerRemote: CheckReachability(): "+
 				"failed to connect, reconnecting: %s", err.Error())
-			if err = md.reconnect(); err != nil {
+			if err = md.reconnectContext(ctx); err != nil {
 				md.log.CInfof(ctx, "reconnect error: %v", err)
 			}
 		} else {
 			md.log.CInfof(ctx, "MDServerRemote: CheckReachability(): "+
 				"failed to connect (%s), but not reconnecting", err.Error())
 		}
+	} else {
+		md.log.CInfof(ctx, "MDServerRemote: CheckReachability(): "+
+			"dial succeeded; fast forwarding any pending reconnect")
+		md.conn.FastForwardInitialBackoffTimer()
 	}
 	if conn != nil {
 		conn.Close()

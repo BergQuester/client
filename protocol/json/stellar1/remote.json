@@ -346,6 +346,40 @@
             "string"
           ],
           "name": "inflationSource"
+        },
+        {
+          "type": "string",
+          "name": "sourceAmountMax"
+        },
+        {
+          "type": "string",
+          "name": "sourceAmountActual"
+        },
+        {
+          "type": "Asset",
+          "name": "sourceAsset"
+        },
+        {
+          "type": "boolean",
+          "name": "isAdvanced"
+        },
+        {
+          "type": "string",
+          "name": "summaryAdvanced"
+        },
+        {
+          "type": {
+            "type": "array",
+            "items": "string"
+          },
+          "name": "operations"
+        },
+        {
+          "type": [
+            null,
+            "PaymentTrustlineLocal"
+          ],
+          "name": "trustline"
         }
       ]
     },
@@ -445,6 +479,10 @@
         {
           "type": "string",
           "name": "cursorToken"
+        },
+        {
+          "type": "boolean",
+          "name": "unread"
         },
         {
           "type": "boolean",
@@ -624,6 +662,17 @@
           "type": "string",
           "name": "externalTxURL",
           "lint": "ignore"
+        },
+        {
+          "type": "string",
+          "name": "feeCharged"
+        },
+        {
+          "type": {
+            "type": "array",
+            "items": "Asset"
+          },
+          "name": "pathIntermediate"
         }
       ]
     },
@@ -938,6 +987,10 @@
         {
           "name": "includeMulti",
           "type": "boolean"
+        },
+        {
+          "name": "includeAdvanced",
+          "type": "boolean"
         }
       ],
       "response": "AccountDetails"
@@ -969,6 +1022,10 @@
         },
         {
           "name": "includeMulti",
+          "type": "boolean"
+        },
+        {
+          "name": "includeAdvanced",
           "type": "boolean"
         }
       ],
@@ -1227,6 +1284,10 @@
         {
           "name": "accountID",
           "type": "AccountID"
+        },
+        {
+          "name": "includeAdvanced",
+          "type": "boolean"
         }
       ],
       "response": "DetailsPlusPayments"
@@ -1246,6 +1307,31 @@
         "type": "array",
         "items": "Asset"
       }
+    },
+    "fuzzyAssetSearch": {
+      "request": [
+        {
+          "name": "caller",
+          "type": "keybase1.UserVersion"
+        },
+        {
+          "name": "searchString",
+          "type": "string"
+        }
+      ],
+      "response": {
+        "type": "array",
+        "items": "Asset"
+      }
+    },
+    "listPopularAssets": {
+      "request": [
+        {
+          "name": "caller",
+          "type": "keybase1.UserVersion"
+        }
+      ],
+      "response": "AssetListResult"
     },
     "changeTrustline": {
       "request": [
@@ -1272,6 +1358,19 @@
         }
       ],
       "response": "PaymentPath"
+    },
+    "postAnyTransaction": {
+      "request": [
+        {
+          "name": "caller",
+          "type": "keybase1.UserVersion"
+        },
+        {
+          "name": "signedTransaction",
+          "type": "string"
+        }
+      ],
+      "response": null
     }
   },
   "namespace": "stellar.1"

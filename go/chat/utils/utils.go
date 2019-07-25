@@ -12,11 +12,12 @@ import (
 	"strings"
 	"time"
 
-	emoji "gopkg.in/kyokomi/emoji.v1"
+	"github.com/keybase/xurls"
 
 	"github.com/keybase/client/go/chat/pager"
 	"github.com/keybase/client/go/chat/unfurl/display"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
+	"github.com/kyokomi/emoji"
 
 	"regexp"
 
@@ -129,7 +130,7 @@ func AggRateLimits(rlimits []chat1.RateLimit) (res []chat1.RateLimit) {
 // This never fails, worse comes to worst it just returns the split of tlfname.
 func ReorderParticipants(mctx libkb.MetaContext, g libkb.UIDMapperContext, umapper libkb.UIDMapper,
 	tlfname string, activeList []gregor1.UID) (writerNames []chat1.ConversationLocalParticipant, err error) {
-	srcWriterNames, _, _, err := splitAndNormalizeTLFNameCanonicalize(mctx.G(), tlfname, false)
+	srcWriterNames, _, _, err := splitAndNormalizeTLFNameCanonicalize(mctx, tlfname, false)
 	if err != nil {
 		return writerNames, err
 	}
@@ -181,12 +182,59 @@ func ReorderParticipants(mctx libkb.MetaContext, g libkb.UIDMapperContext, umapp
 }
 
 // Drive splitAndNormalizeTLFName with one attempt to follow TlfNameNotCanonical.
-func splitAndNormalizeTLFNameCanonicalize(g *libkb.GlobalContext, name string, public bool) (writerNames, readerNames []string, extensionSuffix string, err error) {
-	writerNames, readerNames, extensionSuffix, err = SplitAndNormalizeTLFName(g, name, public)
+func splitAndNormalizeTLFNameCanonicalize(mctx libkb.MetaContext, name string, public bool) (writerNames, readerNames []string, extensionSuffix string, err error) {
+	writerNames, readerNames, extensionSuffix, err = SplitAndNormalizeTLFName(mctx, name, public)
 	if retryErr, retry := err.(TlfNameNotCanonical); retry {
-		return SplitAndNormalizeTLFName(g, retryErr.NameToTry, public)
+		return SplitAndNormalizeTLFName(mctx, retryErr.NameToTry, public)
 	}
 	return writerNames, readerNames, extensionSuffix, err
+}
+
+// AttachContactNames retrieves display names for SBS phones/emails that are in the phonebook.
+func AttachContactNames(mctx libkb.MetaContext, participants []chat1.ConversationLocalParticipant) (withContacts []chat1.ConversationLocalParticipant) {
+	var contacts []keybase1.ProcessedContact
+	var err error
+	contactsFetched := false
+	for _, participant := range participants {
+		if isPhoneOrEmail(participant.Username) {
+			if !contactsFetched {
+				contacts, err = mctx.G().SyncedContactList.RetrieveContacts(mctx)
+				if err != nil {
+					mctx.Debug("Error fetching contacts: %s", err)
+					return participants
+				}
+			}
+			// todo separate phone / email from assertion
+			assertion, err := libkb.ParseAssertionURL(mctx.G().MakeAssertionContext(mctx), participant.Username, true)
+			if err == nil {
+				phoneOrEmail := assertion.GetValue()
+				isPhone := assertion.GetKey() == "phone"
+				contactName := findContactName(contacts, phoneOrEmail, isPhone)
+				participant.ContactName = contactName
+			} else {
+				mctx.Debug("Error parsing assertion: %s", err)
+			}
+		}
+		withContacts = append(withContacts, participant)
+	}
+	return withContacts
+}
+
+func findContactName(contacts []keybase1.ProcessedContact, phoneOrEmail string, isPhone bool) *string {
+	for _, contact := range contacts {
+		cPhoneOrEmail := contact.Component.ValueString()
+		if isPhone {
+			cPhoneOrEmail = keybase1.PhoneNumberToAssertionValue(cPhoneOrEmail)
+		}
+		if cPhoneOrEmail == phoneOrEmail {
+			return &contact.ContactName
+		}
+	}
+	return nil
+}
+
+func isPhoneOrEmail(username string) bool {
+	return strings.HasSuffix(username, "@phone") || strings.HasSuffix(username, "@email")
 }
 
 const (
@@ -624,22 +672,49 @@ func parseRegexpNames(ctx context.Context, body string, re *regexp.Regexp) (res 
 	return res
 }
 
-func GetTextAtMentionedItems(ctx context.Context, g *globals.Context, msg chat1.MessageText,
-	debug *DebugLabeler) (atRes []gregor1.UID, teamRes []chat1.MaybeTeamMention, chanRes chat1.ChannelMention) {
-	atRes, teamRes, chanRes = ParseAtMentionedItems(ctx, g, msg.Body)
+func GetTextAtMentionedItems(ctx context.Context, g *globals.Context, uid gregor1.UID,
+	convID chat1.ConversationID, msg chat1.MessageText,
+	getConvMembs func() ([]chat1.ConversationLocalParticipant, error),
+	debug *DebugLabeler) (atRes []chat1.KnownUserMention, maybeRes []chat1.MaybeMention, chanRes chat1.ChannelMention) {
+	atRes, maybeRes, chanRes = ParseAtMentionedItems(ctx, g, msg.Body, msg.UserMentions, getConvMembs)
 	atRes = append(atRes, GetPaymentAtMentions(ctx, g.GetUPAKLoader(), msg.Payments, debug)...)
-	return atRes, teamRes, chanRes
+	if msg.ReplyTo != nil {
+		if replyMention := GetReplyAtMention(ctx, g, uid, convID, *msg.ReplyTo, debug); replyMention != nil {
+			atRes = append(atRes, *replyMention)
+		}
+	}
+	return atRes, maybeRes, chanRes
+}
+
+func GetReplyAtMention(ctx context.Context, g *globals.Context, uid gregor1.UID,
+	convID chat1.ConversationID, msgID chat1.MessageID, l *DebugLabeler) *chat1.KnownUserMention {
+	reply, err := g.ChatHelper.GetMessage(ctx, uid, convID, msgID, false, nil)
+	if err != nil {
+		l.Debug(ctx, "GetReplyAtMention: failed to get message: %s", err)
+		return nil
+	}
+	if !reply.IsValid() {
+		l.Debug(ctx, "GetReplyAtMention: invalid reply message: %s", err)
+		return nil
+	}
+	return &chat1.KnownUserMention{
+		Text: "",
+		Uid:  reply.Valid().ClientHeader.Sender,
+	}
 }
 
 func GetPaymentAtMentions(ctx context.Context, upak libkb.UPAKLoader, payments []chat1.TextPayment,
-	l *DebugLabeler) (atMentions []gregor1.UID) {
+	l *DebugLabeler) (atMentions []chat1.KnownUserMention) {
 	for _, p := range payments {
 		uid, err := upak.LookupUID(ctx, libkb.NewNormalizedUsername(p.Username))
 		if err != nil {
 			l.Debug(ctx, "GetPaymentAtMentions: error loading uid: username: %s err: %s", p.Username, err)
 			continue
 		}
-		atMentions = append(atMentions, uid.ToBytes())
+		atMentions = append(atMentions, chat1.KnownUserMention{
+			Uid:  uid.ToBytes(),
+			Text: "",
+		})
 	}
 	return atMentions
 }
@@ -652,15 +727,44 @@ func ParseAtMentionsNames(ctx context.Context, body string) (res []string) {
 	return res
 }
 
-func parseItemAsUID(ctx context.Context, upak libkb.UPAKLoader, name string) (gregor1.UID, error) {
-	kuid, err := upak.LookupUID(ctx, libkb.NewNormalizedUsername(name))
-	if err != nil {
-		return nil, err
+func parseItemAsUID(ctx context.Context, g *globals.Context, name string,
+	knownMentions []chat1.KnownUserMention,
+	getConvMembs func() ([]chat1.ConversationLocalParticipant, error)) (gregor1.UID, error) {
+	nname := libkb.NewNormalizedUsername(name)
+	shouldLookup := false
+	for _, known := range knownMentions {
+		if known.Text == name {
+			shouldLookup = true
+			break
+		}
 	}
-	return gregor1.UID(kuid.ToBytes()), nil
+	if !shouldLookup {
+		shouldLookup = libkb.IsUserByUsernameOffline(libkb.NewMetaContext(ctx, g.ExternalG()), nname)
+	}
+	if !shouldLookup && getConvMembs != nil {
+		membs, err := getConvMembs()
+		if err != nil {
+			return nil, err
+		}
+		for _, memb := range membs {
+			if memb.Username == name {
+				shouldLookup = true
+				break
+			}
+		}
+	}
+	if shouldLookup {
+		kuid, err := g.GetUPAKLoader().LookupUID(ctx, nname)
+		if err != nil {
+			return nil, err
+		}
+		return kuid.ToBytes(), nil
+	}
+	return nil, errors.New("not a username")
 }
 
-func ParseAtMentionedItems(ctx context.Context, g *globals.Context, body string) (atRes []gregor1.UID, teamRes []chat1.MaybeTeamMention, chanRes chat1.ChannelMention) {
+func ParseAtMentionedItems(ctx context.Context, g *globals.Context, body string,
+	knownMentions []chat1.KnownUserMention, getConvMembs func() ([]chat1.ConversationLocalParticipant, error)) (atRes []chat1.KnownUserMention, maybeRes []chat1.MaybeMention, chanRes chat1.ChannelMention) {
 	names := ParseAtMentionsNames(ctx, body)
 	chanRes = chat1.ChannelMention_NONE
 	for _, name := range names {
@@ -683,19 +787,20 @@ func ParseAtMentionedItems(ctx context.Context, g *globals.Context, body string)
 		}
 
 		// Try UID first then team
-		if uid, err := parseItemAsUID(ctx, g.GetUPAKLoader(), baseName); err == nil {
-			atRes = append(atRes, uid)
+		if uid, err := parseItemAsUID(ctx, g, baseName, knownMentions, getConvMembs); err == nil {
+			atRes = append(atRes, chat1.KnownUserMention{
+				Text: baseName,
+				Uid:  uid,
+			})
 		} else {
-			_, err := keybase1.TeamNameFromString(baseName)
-			if err == nil {
-				teamRes = append(teamRes, chat1.MaybeTeamMention{
-					Name:    baseName,
-					Channel: channel,
-				})
-			}
+			// anything else is a possible mention
+			maybeRes = append(maybeRes, chat1.MaybeMention{
+				Name:    baseName,
+				Channel: channel,
+			})
 		}
 	}
-	return atRes, teamRes, chanRes
+	return atRes, maybeRes, chanRes
 }
 
 type SystemMessageUIDSource interface {
@@ -916,6 +1021,8 @@ func GetMsgSnippetBody(msg chat1.MessageUnboxed) (snippet string) {
 	switch msg.GetMessageType() {
 	case chat1.MessageType_TEXT:
 		return msg.Valid().MessageBody.Text().Body
+	case chat1.MessageType_EDIT:
+		return msg.Valid().MessageBody.Edit().Body
 	case chat1.MessageType_FLIP:
 		return msg.Valid().MessageBody.Flip().Text
 	case chat1.MessageType_ATTACHMENT:
@@ -967,7 +1074,7 @@ func GetMsgSnippet(msg chat1.MessageUnboxed, conv chat1.ConversationLocal, curre
 
 // We don't want to display the contents of an exploding message in notifications
 func GetDesktopNotificationSnippet(conv *chat1.ConversationLocal, currentUsername string,
-	fromMsg *chat1.MessageUnboxed) string {
+	fromMsg *chat1.MessageUnboxed, plaintextDesktopDisabled bool) string {
 	if conv == nil {
 		return ""
 	}
@@ -982,37 +1089,40 @@ func GetDesktopNotificationSnippet(conv *chat1.ConversationLocal, currentUsernam
 	if !msg.IsValid() {
 		return ""
 	}
+
 	mvalid := msg.Valid()
-	var snippet string
-	if !mvalid.IsEphemeral() {
-		switch msg.GetMessageType() {
-		case chat1.MessageType_REACTION:
-			reaction, err := GetReaction(msg)
-			if err != nil {
-				snippet = ""
-			} else {
-				var prefix string
-				if showSenderPrefix(mvalid, *conv) {
-					prefix = mvalid.SenderUsername + " "
-				}
-				snippet = emoji.Sprintf("%sreacted to your message with %v", prefix, reaction)
-			}
-		default:
-			snippet, _ = GetMsgSnippet(msg, *conv, currentUsername)
+	if mvalid.IsEphemeral() {
+		// If the message is already exploded, nothing to see here.
+		if !msg.IsValidFull() {
+			return ""
 		}
-		return snippet
+		switch msg.GetMessageType() {
+		case chat1.MessageType_TEXT, chat1.MessageType_ATTACHMENT, chat1.MessageType_EDIT:
+			return "💣 exploding message."
+		default:
+			return ""
+		}
+	} else if plaintextDesktopDisabled {
+		return "New message"
 	}
 
-	// If the message is already exploded, nothing to see here.
-	if !msg.IsValidFull() {
-		return ""
-	}
+	var snippet string
 	switch msg.GetMessageType() {
-	case chat1.MessageType_TEXT, chat1.MessageType_ATTACHMENT:
-		return "💣 exploding message."
+	case chat1.MessageType_REACTION:
+		reaction, err := GetReaction(msg)
+		if err != nil {
+			snippet = ""
+		} else {
+			var prefix string
+			if showSenderPrefix(mvalid, *conv) {
+				prefix = mvalid.SenderUsername + " "
+			}
+			snippet = emoji.Sprintf("%sreacted to your message with %v", prefix, reaction)
+		}
 	default:
-		return ""
+		snippet, _ = GetMsgSnippet(msg, *conv, currentUsername)
 	}
+	return snippet
 }
 
 func PresentRemoteConversation(ctx context.Context, g *globals.Context, rc types.RemoteConversation) (res chat1.UnverifiedInboxUIItem) {
@@ -1049,6 +1159,7 @@ func PresentRemoteConversation(ctx context.Context, g *globals.Context, rc types
 		res.LocalMetadata = &chat1.UnverifiedInboxUIItemMetadata{
 			ChannelName:       rc.LocalMetadata.TopicName,
 			Headline:          rc.LocalMetadata.Headline,
+			HeadlineDecorated: DecorateWithLinks(ctx, EscapeForDecorate(ctx, rc.LocalMetadata.Headline)),
 			Snippet:           rc.LocalMetadata.Snippet,
 			SnippetDecoration: rc.LocalMetadata.SnippetDecoration,
 			WriterNames:       rc.LocalMetadata.WriterNames,
@@ -1106,15 +1217,30 @@ func PresentConversationErrorLocal(ctx context.Context, g *globals.Context, rawC
 	return res
 }
 
-func PresentConversationLocal(rawConv chat1.ConversationLocal, currentUsername string) (res chat1.InboxUIItem) {
-	var writerNames []string
-	fullNames := make(map[string]string)
-	for _, p := range rawConv.Info.Participants {
-		writerNames = append(writerNames, p.Username)
-		if p.Fullname != nil {
-			fullNames[p.Username] = *p.Fullname
-		}
+func getParticipantType(username string) chat1.UIParticipantType {
+	if strings.HasSuffix(username, "@phone") {
+		return chat1.UIParticipantType_PHONENO
 	}
+	if strings.HasSuffix(username, "@email") {
+		return chat1.UIParticipantType_EMAIL
+	}
+	return chat1.UIParticipantType_USER
+}
+
+func presentConversationParticipantsLocal(ctx context.Context, rawParticipants []chat1.ConversationLocalParticipant) (participants []chat1.UIParticipant) {
+	for _, p := range rawParticipants {
+		participantType := getParticipantType(p.Username)
+		participants = append(participants, chat1.UIParticipant{
+			Assertion:   p.Username,
+			ContactName: p.ContactName,
+			FullName:    p.Fullname,
+			Type:        participantType,
+		})
+	}
+	return participants
+}
+
+func PresentConversationLocal(ctx context.Context, rawConv chat1.ConversationLocal, currentUsername string) (res chat1.InboxUIItem) {
 	res.ConvID = rawConv.GetConvID().String()
 	res.TopicType = rawConv.GetTopicType()
 	res.IsPublic = rawConv.Info.Visibility == keybase1.TLFVisibility_PUBLIC
@@ -1122,8 +1248,8 @@ func PresentConversationLocal(rawConv chat1.ConversationLocal, currentUsername s
 	res.Snippet, res.SnippetDecoration = GetConvSnippet(rawConv, currentUsername)
 	res.Channel = rawConv.Info.TopicName
 	res.Headline = rawConv.Info.Headline
-	res.Participants = writerNames
-	res.FullNames = fullNames
+	res.HeadlineDecorated = DecorateWithLinks(ctx, EscapeForDecorate(ctx, rawConv.Info.Headline))
+	res.Participants = presentConversationParticipantsLocal(ctx, rawConv.Info.Participants)
 	res.ResetParticipants = rawConv.Info.ResetNames
 	res.Status = rawConv.Info.Status
 	res.MembersType = rawConv.GetMembersType()
@@ -1146,12 +1272,13 @@ func PresentConversationLocal(rawConv chat1.ConversationLocal, currentUsername s
 	res.TeamRetention = rawConv.TeamRetention
 	res.ConvSettings = rawConv.ConvSettings
 	res.Commands = rawConv.Commands
+	res.BotCommands = rawConv.BotCommands
 	return res
 }
 
-func PresentConversationLocals(convs []chat1.ConversationLocal, currentUsername string) (res []chat1.InboxUIItem) {
+func PresentConversationLocals(ctx context.Context, convs []chat1.ConversationLocal, currentUsername string) (res []chat1.InboxUIItem) {
 	for _, conv := range convs {
-		res = append(res, PresentConversationLocal(conv, currentUsername))
+		res = append(res, PresentConversationLocal(ctx, conv, currentUsername))
 	}
 	return res
 }
@@ -1193,7 +1320,7 @@ func formatVideoDuration(ms int) string {
 	return fmt.Sprintf("%d:%02d", minutes, seconds)
 }
 
-func formatVideoSize(bytes int64) string {
+func PresentBytes(bytes int64) string {
 	const (
 		BYTE = 1.0 << (10 * iota)
 		KILOBYTE
@@ -1222,6 +1349,10 @@ func formatVideoSize(bytes int64) string {
 		return "0"
 	}
 	return fmt.Sprintf("%.02f%s", value, unit)
+}
+
+func formatVideoSize(bytes int64) string {
+	return PresentBytes(bytes)
 }
 
 func presentAttachmentAssetInfo(ctx context.Context, g *globals.Context, msg chat1.MessageUnboxed,
@@ -1335,6 +1466,7 @@ func presentRequestInfo(ctx context.Context, g *globals.Context, msgID chat1.Mes
 func PresentUnfurl(ctx context.Context, g *globals.Context, convID chat1.ConversationID, u chat1.Unfurl) *chat1.UnfurlDisplay {
 	ud, err := display.DisplayUnfurl(ctx, g.AttachmentURLSrv, convID, u)
 	if err != nil {
+		g.GetLog().CDebugf(ctx, "PresentUnfurl: failed to display unfurl: %s", err)
 		return nil
 	}
 	return &ud
@@ -1380,22 +1512,34 @@ func PresentDecoratedTextBody(ctx context.Context, g *globals.Context, msg chat1
 	body = EscapeForDecorate(ctx, body)
 	body = EscapeShrugs(ctx, body)
 
+	// Links
+	body = DecorateWithLinks(ctx, body)
 	// Payment decorations
 	body = g.StellarSender.DecorateWithPayments(ctx, body, payments)
 	// Mentions
-	body = DecorateWithMentions(ctx, body, msg.AtMentionUsernames, msg.TeamMentions, msg.ChannelMention,
+	body = DecorateWithMentions(ctx, body, msg.AtMentionUsernames, msg.MaybeMentions, msg.ChannelMention,
 		msg.ChannelNameMentions)
 	return &body
 }
 
-func presentTeamMentions(ctx context.Context, g *globals.Context, uid gregor1.UID,
-	valid chat1.MessageUnboxedValid) (res []chat1.MaybeTeamMention) {
-	for _, tm := range valid.TeamMentions {
-		if err := g.TeamMentionLoader.LoadTeamMention(ctx, uid, tm.Name, tm.Channel); err == nil {
-			res = append(res, tm)
-		}
+func loadTeamMentions(ctx context.Context, g *globals.Context, uid gregor1.UID,
+	valid chat1.MessageUnboxedValid) {
+	var knownTeamMentions []chat1.KnownTeamMention
+	typ, err := valid.MessageBody.MessageType()
+	if err != nil {
+		return
 	}
-	return res
+	switch typ {
+	case chat1.MessageType_TEXT:
+		knownTeamMentions = valid.MessageBody.Text().TeamMentions
+	case chat1.MessageType_FLIP:
+		knownTeamMentions = valid.MessageBody.Flip().TeamMentions
+	case chat1.MessageType_EDIT:
+		knownTeamMentions = valid.MessageBody.Edit().TeamMentions
+	}
+	for _, tm := range valid.MaybeMentions {
+		g.TeamMentionLoader.LoadTeamMention(ctx, uid, tm, knownTeamMentions, false)
+	}
 }
 
 func presentFlipGameID(ctx context.Context, g *globals.Context, uid gregor1.UID,
@@ -1423,6 +1567,14 @@ func presentFlipGameID(ctx context.Context, g *globals.Context, uid gregor1.UID,
 	}
 	ret := body.Flip().GameID.String()
 	return &ret
+}
+
+func PresentMessagesUnboxed(ctx context.Context, g *globals.Context, msgs []chat1.MessageUnboxed,
+	uid gregor1.UID, convID chat1.ConversationID) (res []chat1.UIMessage) {
+	for _, msg := range msgs {
+		res = append(res, PresentMessageUnboxed(ctx, g, msg, uid, convID))
+	}
+	return res
 }
 
 func PresentMessageUnboxed(ctx context.Context, g *globals.Context, rawMsg chat1.MessageUnboxed,
@@ -1465,6 +1617,7 @@ func PresentMessageUnboxed(ctx context.Context, g *globals.Context, rawMsg chat1
 			replyTo = new(chat1.UIMessage)
 			*replyTo = PresentMessageUnboxed(ctx, g, *valid.ReplyTo, uid, convID)
 		}
+		loadTeamMentions(ctx, g, uid, valid)
 		res = chat1.NewUIMessageWithValid(chat1.UIMessageValid{
 			MessageID:             rawMsg.GetMessageID(),
 			Ctime:                 valid.ServerHeader.Ctime,
@@ -1482,7 +1635,6 @@ func PresentMessageUnboxed(ctx context.Context, g *globals.Context, rawMsg chat1
 			AtMentions:            valid.AtMentionUsernames,
 			ChannelMention:        valid.ChannelMention,
 			ChannelNameMentions:   PresentChannelNameMentions(ctx, valid.ChannelNameMentions),
-			TeamMentions:          presentTeamMentions(ctx, g, uid, valid),
 			AssetUrlInfo:          presentAttachmentAssetInfo(ctx, g, rawMsg, convID),
 			IsEphemeral:           valid.IsEphemeral(),
 			IsEphemeralExpired:    valid.IsEphemeralExpired(time.Now()),
@@ -1877,13 +2029,14 @@ func GetGregorConn(ctx context.Context, g *globals.Context, log DebugLabeler,
 			log.Debug(ctx, "GetGregorConn: failed to parse CAs: %s", err.Error())
 			return conn, token, err
 		}
-		conn = rpc.NewTLSConnection(rpc.NewFixedRemote(uri.HostPort),
+		conn = rpc.NewTLSConnectionWithDialable(rpc.NewFixedRemote(uri.HostPort),
 			[]byte(rawCA), libkb.NewContextifiedErrorUnwrapper(g.ExternalG()),
 			handler(nist), libkb.NewRPCLogFactory(g.ExternalG()),
 			logger.LogOutputWithDepthAdder{Logger: g.Log},
-			rpc.DefaultMaxFrameLength, rpc.ConnectionOpts{})
+			rpc.DefaultMaxFrameLength, rpc.ConnectionOpts{},
+			libkb.NewProxyDialable(g.Env))
 	} else {
-		t := rpc.NewConnectionTransport(uri, nil, libkb.MakeWrapError(g.ExternalG()), rpc.DefaultMaxFrameLength)
+		t := rpc.NewConnectionTransportWithDialable(uri, nil, libkb.MakeWrapError(g.ExternalG()), rpc.DefaultMaxFrameLength, libkb.NewProxyDialable(g.GetEnv()))
 		conn = rpc.NewConnectionWithTransport(handler(nist), t,
 			libkb.NewContextifiedErrorUnwrapper(g.ExternalG()),
 			logger.LogOutputWithDepthAdder{Logger: g.Log}, rpc.ConnectionOpts{})
@@ -1924,6 +2077,18 @@ func SuspendComponent(ctx context.Context, g *globals.Context, suspendable types
 	}
 }
 
+func SuspendComponents(ctx context.Context, g *globals.Context, suspendables []types.Suspendable) func() {
+	resumeFuncs := []func(){}
+	for _, s := range suspendables {
+		resumeFuncs = append(resumeFuncs, SuspendComponent(ctx, g, s))
+	}
+	return func() {
+		for _, f := range resumeFuncs {
+			f()
+		}
+	}
+}
+
 func IsPermanentErr(err error) bool {
 	if uberr, ok := err.(types.UnboxingError); ok {
 		return uberr.IsPermanent()
@@ -1931,7 +2096,7 @@ func IsPermanentErr(err error) bool {
 	return err != nil
 }
 
-func EphemeralLifetimeFromConv(ctx context.Context, g *globals.Context, conv chat1.Conversation) (res *gregor1.DurationSec, err error) {
+func EphemeralLifetimeFromConv(ctx context.Context, g *globals.Context, conv chat1.ConversationLocal) (res *gregor1.DurationSec, err error) {
 	// Check to see if the conversation has an exploding policy
 	var retentionRes *gregor1.DurationSec
 	var gregorRes *gregor1.DurationSec
@@ -2023,25 +2188,111 @@ func DecorateBody(ctx context.Context, body string, offset, length int, decorati
 	return res, added
 }
 
+var linkRegexp = xurls.Relaxed()
+
+// These indices correspond to the named capture groups in the xurls regexes
+var linkRelaxedGroupIndex = 0
+var linkStrictGroupIndex = 0
+var mailtoRegexp = regexp.MustCompile(`(?:(?:[\w-_.]+)@(?:[\w-]+(?:\.[\w-]+)+))\b`)
+
+func init() {
+	for index, name := range linkRegexp.SubexpNames() {
+		if name == "relaxed" {
+			linkRelaxedGroupIndex = index + 1
+		}
+		if name == "strict" {
+			linkStrictGroupIndex = index + 1
+		}
+	}
+}
+
+func DecorateWithLinks(ctx context.Context, body string) string {
+	var added int
+	offset := 0
+	origBody := body
+
+	shouldSkipLink := func(body string) bool {
+		if strings.Contains(strings.Split(body, "/")[0], "@") {
+			return true
+		}
+		for _, scheme := range xurls.SchemesNoAuthority {
+			if strings.HasPrefix(body, scheme) {
+				return true
+			}
+		}
+		if strings.HasPrefix(body, "ftp://") || strings.HasPrefix(body, "gopher://") {
+			return true
+		}
+		return false
+	}
+	allMatches := linkRegexp.FindAllStringSubmatchIndex(ReplaceQuotedSubstrings(body, true), -1)
+	for _, match := range allMatches {
+		var lowhit, highhit int
+		if len(match) >= linkRelaxedGroupIndex*2 && match[linkRelaxedGroupIndex*2-2] >= 0 {
+			lowhit = linkRelaxedGroupIndex*2 - 2
+			highhit = linkRelaxedGroupIndex*2 - 1
+		} else if len(match) >= linkStrictGroupIndex*2 && match[linkStrictGroupIndex*2-2] >= 0 {
+			lowhit = linkStrictGroupIndex*2 - 2
+			highhit = linkStrictGroupIndex*2 - 1
+		} else {
+			continue
+		}
+
+		bodyMatch := origBody[match[lowhit]:match[highhit]]
+		url := bodyMatch
+		if shouldSkipLink(bodyMatch) {
+			continue
+		}
+		if !(strings.HasPrefix(bodyMatch, "http://") || strings.HasPrefix(bodyMatch, "https://")) {
+			url = "http://" + bodyMatch
+		}
+		body, added = DecorateBody(ctx, body, match[lowhit]+offset, match[highhit]-match[lowhit],
+			chat1.NewUITextDecorationWithLink(chat1.UILinkDecoration{
+				Display: bodyMatch,
+				Url:     url,
+			}))
+		offset += added
+	}
+
+	offset = 0
+	origBody = body
+	allMatches = mailtoRegexp.FindAllStringIndex(ReplaceQuotedSubstrings(body, true), -1)
+	for _, match := range allMatches {
+		if len(match) < 2 {
+			continue
+		}
+		bodyMatch := origBody[match[0]:match[1]]
+		url := "mailto:" + bodyMatch
+		body, added = DecorateBody(ctx, body, match[0]+offset, match[1]-match[0],
+			chat1.NewUITextDecorationWithMailto(chat1.UILinkDecoration{
+				Display: bodyMatch,
+				Url:     url,
+			}))
+		offset += added
+	}
+
+	return body
+}
+
 func DecorateWithMentions(ctx context.Context, body string, atMentions []string,
-	teamMentions []chat1.MaybeTeamMention, chanMention chat1.ChannelMention,
+	maybeMentions []chat1.MaybeMention, chanMention chat1.ChannelMention,
 	channelNameMentions []chat1.ChannelNameMention) string {
 	var added int
 	offset := 0
-	if len(atMentions) > 0 || len(teamMentions) > 0 || chanMention != chat1.ChannelMention_NONE {
+	if len(atMentions) > 0 || len(maybeMentions) > 0 || chanMention != chat1.ChannelMention_NONE {
 		inputBody := body
 		atMatches := parseRegexpNames(ctx, inputBody, atMentionRegExp)
 		atMap := make(map[string]bool)
-		teamMap := make(map[string]chat1.MaybeTeamMention)
+		maybeMap := make(map[string]chat1.MaybeMention)
 		for _, at := range atMentions {
 			atMap[at] = true
 		}
-		for _, tm := range teamMentions {
+		for _, tm := range maybeMentions {
 			name := tm.Name
 			if len(tm.Channel) > 0 {
 				name += "#" + tm.Channel
 			}
-			teamMap[name] = tm
+			maybeMap[name] = tm
 		}
 		for _, m := range atMatches {
 			switch {
@@ -2059,9 +2310,9 @@ func DecorateWithMentions(ctx context.Context, body string, atMentions []string,
 					chat1.NewUITextDecorationWithAtmention(m.name))
 				offset += added
 			}
-			if tm, ok := teamMap[m.name]; ok {
+			if tm, ok := maybeMap[m.name]; ok {
 				body, added = DecorateBody(ctx, body, m.position[0]+offset-1, m.Len()+1,
-					chat1.NewUITextDecorationWithTeammention(tm))
+					chat1.NewUITextDecorationWithMaybemention(tm))
 				offset += added
 			}
 		}
@@ -2160,4 +2411,17 @@ func GetVerifiedConv(ctx context.Context, g *globals.Context, uid gregor1.UID,
 			inbox.Convs[0].GetConvID(), convID)
 	}
 	return inbox.Convs[0], nil
+}
+
+func DedupStringLists(lists ...[]string) (res []string) {
+	seen := make(map[string]struct{})
+	for _, list := range lists {
+		for _, x := range list {
+			if _, ok := seen[x]; !ok {
+				seen[x] = struct{}{}
+				res = append(res, x)
+			}
+		}
+	}
+	return res
 }

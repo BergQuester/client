@@ -30,7 +30,11 @@ func setupFileDataTest(t *testing.T, maxBlockSize int64,
 		DirectType: DirectBlock,
 	}
 	id := tlf.FakeID(1, tlf.Private)
-	file := Path{FolderBranch{Tlf: id}, []PathNode{{ptr, "file"}}}
+	file := Path{
+		FolderBranch{Tlf: id},
+		[]PathNode{{ptr, NewPathPartString("file", nil)}},
+		nil,
+	}
 	chargedTo := keybase1.MakeTestUID(1).AsUserOrTeam()
 	bsplit := &BlockSplitterSimple{maxBlockSize, maxPtrsPerBlock, 10, 0}
 	kmd := libkeytest.NewEmptyKeyMetadata(id, 1)
@@ -279,9 +283,10 @@ func testFileDataWriteExtendEmptyFile(t *testing.T, maxBlockSize Int64Offset,
 	fd, cleanBcache, dirtyBcache, df := setupFileDataTest(
 		t, int64(maxBlockSize), maxPtrsPerBlock)
 	topBlock := NewFileBlock().(*FileBlock)
-	cleanBcache.Put(
+	err := cleanBcache.Put(
 		fd.rootBlockPointer(), fd.tree.file.Tlf, topBlock, TransientEntry,
 		SkipCacheHash)
+	require.NoError(t, err)
 	de := DirEntry{}
 	data := make([]byte, fullDataLen)
 	for i := 0; i < int(fullDataLen); i++ {
@@ -409,8 +414,9 @@ func testFileDataLevelExistingBlocks(t *testing.T, fd *FileData,
 					BlockInfo: BlockInfo{ptr, 0},
 					Off:       off,
 				})
-				cleanBcache.Put(
+				err = cleanBcache.Put(
 					ptr, fd.tree.file.Tlf, child, TransientEntry, SkipCacheHash)
+				require.NoError(t, err)
 			}
 			prevChildIndex = newIndex
 			level = append(level, fblock)
@@ -423,9 +429,10 @@ func testFileDataLevelExistingBlocks(t *testing.T, fd *FileData,
 		fd.tree.file.Path[len(fd.tree.file.Path)-1].DirectType = IndirectBlock
 	}
 
-	cleanBcache.Put(
+	err := cleanBcache.Put(
 		fd.rootBlockPointer(), fd.tree.file.Tlf, prevChildren[0],
 		TransientEntry, SkipCacheHash)
+	require.NoError(t, err)
 	return prevChildren[0], numLevels
 }
 

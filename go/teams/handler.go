@@ -78,7 +78,13 @@ func HandleRotateRequest(ctx context.Context, g *libkb.GlobalContext, msg keybas
 		}
 
 		g.Log.CDebugf(ctx, "rotating team %s (%s)", team.Name(), teamID)
-		if err := team.Rotate(ctx); err != nil {
+
+		rotationType := keybase1.RotationType_CLKR
+		if teamID.IsPublic() {
+			rotationType = keybase1.RotationType_VISIBLE
+		}
+
+		if err := team.Rotate(ctx, rotationType); err != nil {
 			g.Log.CDebugf(ctx, "rotating team %s (%s) error: %s", team.Name(), teamID, err)
 			return err
 		}
@@ -191,7 +197,8 @@ func sweepOpenTeamResetAndDeletedMembers(ctx context.Context, g *libkb.GlobalCon
 				if err != nil {
 					continue
 				}
-				if role == keybase1.TeamRole_READER || role == keybase1.TeamRole_WRITER {
+				switch role {
+				case keybase1.TeamRole_RESTRICTEDBOT, keybase1.TeamRole_READER, keybase1.TeamRole_WRITER:
 					changeReq.None = append(changeReq.None, memberUV)
 				}
 			}
@@ -225,32 +232,43 @@ func sweepOpenTeamResetAndDeletedMembers(ctx context.Context, g *libkb.GlobalCon
 	return postedLink, err
 }
 
-func refreshKBFSFavoritesCache(g *libkb.GlobalContext) {
-	g.NotifyRouter.HandleFavoritesChanged(g.GetMyUID())
+func invalidateCaches(mctx libkb.MetaContext, teamID keybase1.TeamID) {
+	// refresh the KBFS Favorites cache since it no longer should contain
+	// this team.
+	mctx.G().NotifyRouter.HandleFavoritesChanged(mctx.G().GetMyUID())
+	if ekLib := mctx.G().GetEKLib(); ekLib != nil {
+		ekLib.PurgeTeamEKCachesForTeamID(mctx, teamID)
+		ekLib.PurgeTeambotEKCachesForTeamID(mctx, teamID)
+	}
+	if keyer := mctx.G().GetTeambotMemberKeyer(); keyer != nil {
+		keyer.PurgeCache(mctx)
+	}
 }
 
 func handleChangeSingle(ctx context.Context, g *libkb.GlobalContext, row keybase1.TeamChangeRow, change keybase1.TeamChangeSet) (err error) {
 	change.KeyRotated = row.KeyRotated
 	change.MembershipChanged = row.MembershipChanged
 	change.Misc = row.Misc
-	m := libkb.NewMetaContext(ctx, g)
+	mctx := libkb.NewMetaContext(ctx, g)
 
-	defer m.Trace(fmt.Sprintf("team.handleChangeSingle(%+v, %+v)", row, change), func() error { return err })()
+	defer mctx.Trace(fmt.Sprintf("team.handleChangeSingle(%+v, %+v)", row, change),
+		func() error { return err })()
 
-	HintLatestSeqno(m, row.Id, row.LatestSeqno)
+	HintLatestSeqno(mctx, row.Id, row.LatestSeqno)
+	HintLatestHiddenSeqno(mctx, row.Id, row.LatestHiddenSeqno)
 
 	// If we're handling a rename we should also purge the resolver cache and
 	// the KBFS favorites cache
 	if change.Renamed {
 		if err = PurgeResolverTeamID(ctx, g, row.Id); err != nil {
-			m.Warning("error in PurgeResolverTeamID: %v", err)
+			mctx.Warning("error in PurgeResolverTeamID: %v", err)
 			err = nil // non-fatal
 		}
-		refreshKBFSFavoritesCache(g)
+		invalidateCaches(mctx, row.Id)
 	}
 	// Send teamID and teamName in two separate notifications. It is
 	// server-trust that they are the same team.
-	g.NotifyRouter.HandleTeamChangedByBothKeys(ctx, row.Id, row.Name, row.LatestSeqno, row.ImplicitTeam, change)
+	g.NotifyRouter.HandleTeamChangedByBothKeys(ctx, row.Id, row.Name, row.LatestSeqno, row.ImplicitTeam, change, row.LatestHiddenSeqno)
 
 	if change.Renamed || change.MembershipChanged || change.Misc {
 		// this notification is specifically for the UI
@@ -274,59 +292,42 @@ func HandleChangeNotification(ctx context.Context, g *libkb.GlobalContext, rows 
 }
 
 func HandleDeleteNotification(ctx context.Context, g *libkb.GlobalContext, rows []keybase1.TeamChangeRow) (err error) {
-	defer g.CTrace(ctx, fmt.Sprintf("team.HandleDeleteNotification(%v)", len(rows)), func() error { return err })()
+	mctx := libkb.NewMetaContext(ctx, g)
+	defer mctx.Trace(fmt.Sprintf("team.HandleDeleteNotification(%v)", len(rows)),
+		func() error { return err })()
 
 	for _, row := range rows {
 		g.Log.CDebugf(ctx, "team.HandleDeleteNotification: (%+v)", row)
-		err := g.GetTeamLoader().Delete(ctx, row.Id)
-		if err != nil {
-			g.Log.CDebugf(ctx, "team.HandleDeleteNotification: error deleting team cache: %v", err)
-		}
+		TombstoneTeam(libkb.NewMetaContext(ctx, g), row.Id)
+		invalidateCaches(mctx, row.Id)
 		g.NotifyRouter.HandleTeamDeleted(ctx, row.Id)
 	}
-
-	// refresh the KBFS Favorites cache since it no longer should contain
-	// this team.
-	refreshKBFSFavoritesCache(g)
 
 	return nil
 }
 
 func HandleExitNotification(ctx context.Context, g *libkb.GlobalContext, rows []keybase1.TeamExitRow) (err error) {
 	mctx := libkb.NewMetaContext(ctx, g)
-	defer mctx.Trace(fmt.Sprintf("team.HandleExitNotification(%v)", len(rows)), func() error { return err })()
+	defer mctx.Trace(fmt.Sprintf("team.HandleExitNotification(%v)", len(rows)),
+		func() error { return err })()
 
 	for _, row := range rows {
 		mctx.Debug("team.HandleExitNotification: (%+v)", row)
-		if err := mctx.G().GetTeamLoader().Delete(ctx, row.Id); err != nil {
-			mctx.Debug("team.HandleExitNotification: error deleting team cache: %v", err)
-		}
-		if ekLib := mctx.G().GetEKLib(); ekLib != nil {
-			ekLib.PurgeCachesForTeamID(mctx, row.Id)
-		}
+		FreezeTeam(mctx, row.Id)
+		invalidateCaches(mctx, row.Id)
 		mctx.G().NotifyRouter.HandleTeamExit(ctx, row.Id)
-
-		// refresh the KBFS Favorites cache since it no longer should contain
-		// this team.
-		refreshKBFSFavoritesCache(mctx.G())
 	}
 	return nil
 }
 
 func HandleNewlyAddedToTeamNotification(ctx context.Context, g *libkb.GlobalContext, rows []keybase1.TeamNewlyAddedRow) (err error) {
 	mctx := libkb.NewMetaContext(ctx, g)
-	defer mctx.Trace(fmt.Sprintf("team.HandleNewlyAddedToTeamNotification(%v)", len(rows)), func() error { return err })()
+	defer mctx.Trace(fmt.Sprintf("team.HandleNewlyAddedToTeamNotification(%v)", len(rows)),
+		func() error { return err })()
 	for _, row := range rows {
 		mctx.Debug("team.HandleNewlyAddedToTeamNotification: (%+v)", row)
-		if ekLib := mctx.G().GetEKLib(); ekLib != nil {
-			ekLib.PurgeCachesForTeamID(mctx, row.Id)
-		}
 		mctx.G().NotifyRouter.HandleNewlyAddedToTeam(mctx.Ctx(), row.Id)
-
-		// refresh the KBFS Favorites cache since it now should contain
-		// this team.
-		refreshKBFSFavoritesCache(mctx.G())
-
+		invalidateCaches(mctx, row.Id)
 	}
 	return nil
 }
@@ -489,7 +490,9 @@ func HandleOpenTeamAccessRequest(ctx context.Context, g *libkb.GlobalContext, ms
 		}
 
 		joinAsRole := team.chain().inner.OpenTeamJoinAs
-		if joinAsRole != keybase1.TeamRole_READER && joinAsRole != keybase1.TeamRole_WRITER {
+		switch joinAsRole {
+		case keybase1.TeamRole_READER, keybase1.TeamRole_WRITER:
+		default:
 			return fmt.Errorf("unexpected role to add to open team: %v", joinAsRole)
 		}
 

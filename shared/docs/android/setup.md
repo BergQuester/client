@@ -47,7 +47,7 @@ KERNEL=="kvm", NAME="%k", GROUP="kvm", MODE="0660"
 ## Android Studio
 
 Select "Open an existing Android Studio Project" and point it to
-`shared/react-native/android`. Not necessary to register the `client`
+`shared/android`. Not necessary to register the `client`
 dir as a VCS-controlled dir with Android studio, but may as well.
 
 You'll get various prompts about installing various tools. You should
@@ -70,8 +70,8 @@ Project with Gradle Files'.
 
 Sometimes, especially after opening Android Studio after a run of
 `yarn modules`, you'll get an "Unsupported Modules Detected" message
-for "react-native-fetch-blob", "react-native-contacts", and
-"react-native-image-picker". This seems to be harmless.
+for "react-native-fetch-blob" and "react-native-contacts". This seems
+to be harmless.
 
 Sometimes you'll also get an "An IDE Error has occured" message. That
 also seems to be harmless, although you may want to resync/reopen the
@@ -95,8 +95,8 @@ Then run
 # Build the apk.
 yarn rn-build-android
 
-# Or with gradle (inside react-native/android)
-# You can also use the gradle wrapper `./gradlew` in react-native/android
+# Or with gradle (inside android)
+# You can also use the gradle wrapper `./gradlew` in android
 gradle installDebug
 
 
@@ -151,7 +151,8 @@ instructions](https://facebook.github.io/react-native/docs/running-on-device.htm
 plug in your device via USB and tap 'OK' on the 'Allow USB debugging?'
 prompt if it appears. After that, `adb devices` should list your
 device. If it says 'unauthorized' next to your device, then you likely
-haven't tapped 'OK' on the prompt yet.
+haven't tapped 'OK' on the prompt yet. If you saw no prompt, try
+revoking (https://stackoverflow.com/a/25546300/670659).
 
 **Turn off Instant Run**
 
@@ -176,7 +177,7 @@ To recap, you should have run:
 1. `adb devices` (should list *exactly* one device) 
 1. `yarn rn-gobuild-android`,
 1. `yarn rn-start android`
-1. `yarn rn-build-android` (or `gradle installDebug` inside react-native/android),
+1. `yarn rn-build-android` (or `gradle installDebug` inside android),
 1. `yarn rn-push-android` (To install the apk on the device. NOTE: `gradle installDebug` does this automatically)
 
 and have an emulator or android device connected. (i.e. `adb devices` should list *exactly* one device) 

@@ -4,7 +4,7 @@
     "import * as Types from '../constants/types/chat2'",
     "import * as TeamsTypes from '../constants/types/teams'",
     "import HiddenString from '../util/hidden-string'",
-    "import type {RetentionPolicy} from '../constants/types/retention-policy'"
+    "import {RetentionPolicy} from '../constants/types/retention-policy'"
   ],
   "actions": {
     "toggleSmallTeamsExpanded": {},
@@ -43,6 +43,10 @@
         "'teamMention'" // from team mention
       ]
     },
+    // Got an error while creating a conversation.
+    "conversationErrored": {
+      "message": "string"
+    },
     // Select an existing conversation or setup an empty one. Can either be adhoc or a tlf (adhoc or team)
     // fromAReset means you were in a reset kbfs convo and you want to make a new one
     // Chatting from external places in the app should usually call this
@@ -68,8 +72,10 @@
         "'memberView'",
         "'newChannel'",
         "'transaction'",
+        "'sentPayment'",
         "'requestedPayment'",
-        "'teamMention'"
+        "'teamMention'",
+        "'appLink'"
       ]
     },
     "createConversation": {
@@ -127,8 +133,8 @@
     // Got some inbox errors
     "metaReceivedError": {
       "conversationIDKey": "Types.ConversationIDKey",
-      "error": "?RPCChatTypes.InboxUIItemError",
-      "username": "?string"
+      "error": "RPCChatTypes.InboxUIItemError | null",
+      "username": "string | null"
     },
     // We got a status update saying it was blocked or ignored
     "metaDelete": {
@@ -165,7 +171,7 @@
     // Start editing a message / or edit the last message / or clear editing
     "messageSetEditing": {
       "conversationIDKey": "Types.ConversationIDKey",
-      "ordinal": "?Types.Ordinal",
+      "ordinal": "Types.Ordinal | null",
       "editLastUser?": "string"
     },
     // Start quoting a message / or clear quoting
@@ -313,7 +319,7 @@
     // Update the loading bars
     "attachmentLoading": {
       "conversationIDKey": "Types.ConversationIDKey",
-      "ordinal": "Types.Ordinal",
+      "message": "Types.Message",
       "ratio": "number", // 0-1
       "isPreview": "boolean"
     },
@@ -346,6 +352,7 @@
       "data": "Buffer"
     },
     "attachmentFullscreenSelection": {
+      "autoPlay": "boolean",
       "message": "Types.Message"
     },
     "attachmentFullscreenNext": {
@@ -382,13 +389,11 @@
     "navigateToThread": {},
     // Share to external app on mobile
     "messageAttachmentNativeShare": {
-      "conversationIDKey": "Types.ConversationIDKey",
-      "ordinal": "Types.Ordinal"
+      "message": "Types.Message"
     },
     // Save on mobile (camera roll)
     "messageAttachmentNativeSave": {
-      "conversationIDKey": "Types.ConversationIDKey",
-      "ordinal": "Types.Ordinal"
+      "message": "Types.Message"
     },
     // We're changing the notification settings
     "updateNotificationSettings": {
@@ -464,7 +469,8 @@
     "saveMinWriterRole": {
       "_description": "Update the minWriterRole stored with the conversation metadata.",
       "conversationIDKey": "Types.ConversationIDKey",
-      "role": "TeamsTypes.TeamRoleType"
+      "role": "TeamsTypes.TeamRoleType",
+      "cannotWrite": "boolean"
     },
     "openChatFromWidget": {
       "conversationIDKey?": "Types.ConversationIDKey"
@@ -548,7 +554,12 @@
     "setUnsentText": {
       "_description": "Set unsent text for a conversation",
       "conversationIDKey": "Types.ConversationIDKey",
-      "text": "?HiddenString"
+      "text": "HiddenString | null"
+    },
+    "setPrependText": {
+      "_description": "Set prepend text for a conversation",
+      "conversationIDKey": "Types.ConversationIDKey",
+      "text": "HiddenString | null"
     },
     "updateUnreadline": {
       "_description": "Update the unreadline line position for a conversation",
@@ -569,7 +580,7 @@
     "setCommandMarkdown": {
       "_description": "Set command markdown for a conversation",
       "conversationIDKey": "Types.ConversationIDKey",
-      "md": "?RPCChatTypes.UICommandMarkdown"
+      "md": "RPCChatTypes.UICommandMarkdown | null"
     },
     "addUsersToChannel": {
       "_description": "Add a list of users to a conversation. Creates a SystemBulkAddToConv message.",
@@ -658,10 +669,10 @@
       "_description": "Set index percent complete",
       "percent": "number"
     },
-    "setTeamMentionInfo": {
+    "setMaybeMentionInfo": {
       "_description": "Set team mention info",
       "name": "string",
-      "info": "RPCChatTypes.UITeamMention"
+      "info": "RPCChatTypes.UIMaybeMentionInfo"
     },
     "tabSelected": {
       "_description": "Desktop changed tab to chat"
@@ -669,6 +680,46 @@
     "setInboxShowIsNew": {
       "_description": "We've seen chat search before",
       "isNew": "boolean"
+    },
+    "resolveMaybeMention": {
+      "_description": "Resolve an unknown @ mention",
+      "name": "string",
+      "channel": "string"
+    },
+    "loadAttachmentView": {
+      "_description": "Load attachment view pane",
+      "conversationIDKey": "Types.ConversationIDKey",
+      "viewType": "RPCChatTypes.GalleryItemTyp",
+      "fromMsgID?": "Types.MessageID"
+    },
+    "addAttachmentViewMessage": {
+      "_description": "Add result for attachment view",
+      "conversationIDKey": "Types.ConversationIDKey",
+      "viewType": "RPCChatTypes.GalleryItemTyp",
+      "message": "Types.Message"
+    },
+    "setAttachmentViewStatus": {
+      "_description": "Set attachment view status",
+      "conversationIDKey": "Types.ConversationIDKey",
+      "viewType": "RPCChatTypes.GalleryItemTyp",
+      "status": "Types.AttachmentViewStatus",
+      "last?": "boolean"
+    },
+    "clearAttachmentView": {
+      "_description": "Clear attachment views",
+      "conversationIDKey": "Types.ConversationIDKey"
+    },
+    "updateUserReacjis": {
+      "userReacjis": "RPCTypes.UserReacjis"
+    },
+    "setCommandStatusInfo": {
+      "_description": "Set command status info",
+      "conversationIDKey": "Types.ConversationIDKey",
+      "info": "Types.CommandStatusInfo"
+    },
+    "clearCommandStatusInfo": {
+      "_description": "Clear command status info",
+      "conversationIDKey": "Types.ConversationIDKey"
     }
   }
 }
